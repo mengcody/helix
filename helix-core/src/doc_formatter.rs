@@ -463,12 +463,26 @@ impl<'t> Iterator for DocumentFormatter<'t> {
         if grapheme.raw == Grapheme::Newline {
             // move to end of newline char
             self.visual_pos.col += 1;
+            let skip = self.annotations.lines_to_skip_after_line(self.line_pos);
+            if skip > 0 && !grapheme.is_virtual() {
+                // Advance past folded lines: consume graphemes until we've seen `skip` newlines
+                let mut newlines_seen = 0usize;
+                while newlines_seen < skip {
+                    let Some(g) = self.graphemes.next() else {
+                        break;
+                    };
+                    self.char_pos += g.len_chars();
+                    newlines_seen += g.chars().filter(|&c| c == '\n').count();
+                }
+                // We were at line_pos (fold start); we skipped skip lines, so now at start of line_pos + skip + 1
+                self.line_pos += skip + 1;
+            }
             let virtual_lines =
                 self.annotations
                     .virtual_lines_at(self.char_pos, self.visual_pos, self.line_pos);
             self.visual_pos.row += 1 + virtual_lines;
             self.visual_pos.col = 0;
-            if !grapheme.is_virtual() {
+            if !grapheme.is_virtual() && skip == 0 {
                 self.line_pos += 1;
             }
         } else {

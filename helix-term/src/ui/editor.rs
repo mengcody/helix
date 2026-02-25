@@ -196,6 +196,9 @@ impl EditorView {
             inline_diagnostic_config,
             config.end_of_line_diagnostics,
         ));
+        decorations.add_decoration(text_decorations::FoldDecoration::new(
+            doc, view.id, theme,
+        ));
         render_document(
             surface,
             inner,

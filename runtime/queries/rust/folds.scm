@@ -1,0 +1,17 @@
+[
+  (function_item)
+  (closure_expression)
+  (struct_item)
+  (enum_item)
+  (union_item)
+  (trait_item)
+  (impl_item)
+  (mod_item)
+  (match_expression)
+  (if_expression)
+  (for_expression)
+  (while_expression)
+  (loop_expression)
+  (macro_definition)
+  (block_comment)
+] @fold

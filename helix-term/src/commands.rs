@@ -616,6 +616,13 @@ impl MappableCommand {
         goto_prev_tabstop, "Goto next snippet placeholder",
         rotate_selections_first, "Make the first selection your primary one",
         rotate_selections_last, "Make the last selection your primary one",
+        toggle_fold, "Toggle fold at cursor",
+        fold, "Fold at cursor",
+        unfold, "Unfold at cursor",
+        fold_all, "Fold all foldable regions",
+        unfold_all, "Unfold all folded regions",
+        fold_recursive, "Recursively fold at cursor",
+        unfold_recursive, "Recursively unfold at cursor",
     );
 }
 
@@ -6962,5 +6969,213 @@ fn lsp_or_syntax_workspace_symbol_picker(cx: &mut Context) {
         lsp::workspace_symbol_picker(cx);
     } else {
         syntax_workspace_symbol_picker(cx);
+    }
+}
+
+// === Fold Commands ===
+
+use helix_core::fold;
+
+fn get_fold_regions(doc: &helix_view::Document) -> Option<Vec<fold::FoldRegion>> {
+    let syntax = doc.syntax.as_ref()?;
+    let text = doc.text().slice(..);
+    let language_name = doc.language_name()?;
+    let grammar_name = doc
+        .language_config()
+        .and_then(|config| config.grammar.as_deref())
+        .unwrap_or(language_name);
+    Some(fold::get_foldable_ranges(
+        syntax,
+        text,
+        language_name,
+        grammar_name,
+    ))
+}
+
+/// Toggle fold at cursor position
+fn toggle_fold(cx: &mut Context) {
+    let (view, doc) = current!(cx.editor);
+    doc.ensure_view_init(view.id);
+
+    let text = doc.text().slice(..);
+    let line = doc.selection(view.id).primary().cursor_line(text);
+
+    let regions = if let Some(regions) = get_fold_regions(doc) {
+        regions
+    } else {
+        cx.editor
+            .set_error("No syntax tree or language configuration available for folding");
+        return;
+    };
+
+    if let Some(region) = fold::get_fold_at_line(&regions, line) {
+        let view_id = view.id;
+        let folded = {
+            let fold_state = doc.fold_state_mut(view_id).unwrap();
+            fold_state.toggle(region.start_line)
+        };
+        if folded && line != region.start_line {
+            let start_char = doc.text().line_to_char(region.start_line);
+            doc.set_selection(view_id, Selection::point(start_char));
+        }
+    } else {
+        cx.editor.set_error("No foldable region found at cursor");
+    }
+}
+
+/// Fold at cursor position
+fn fold(cx: &mut Context) {
+    let (view, doc) = current!(cx.editor);
+    doc.ensure_view_init(view.id);
+
+    let text = doc.text().slice(..);
+    let line = doc.selection(view.id).primary().cursor_line(text);
+
+    let regions = if let Some(regions) = get_fold_regions(doc) {
+        regions
+    } else {
+        cx.editor
+            .set_error("No syntax tree or language configuration available for folding");
+        return;
+    };
+
+    if let Some(region) = fold::get_fold_at_line(&regions, line) {
+        let view_id = view.id;
+        {
+            let fold_state = doc.fold_state_mut(view_id).unwrap();
+            fold_state.fold(region.start_line);
+        }
+        if line != region.start_line {
+            let start_char = doc.text().line_to_char(region.start_line);
+            doc.set_selection(view_id, Selection::point(start_char));
+        }
+    } else {
+        cx.editor.set_error("No foldable region found at cursor");
+    }
+}
+
+/// Unfold at cursor position
+fn unfold(cx: &mut Context) {
+    let (view, doc) = current!(cx.editor);
+    doc.ensure_view_init(view.id);
+
+    let text = doc.text().slice(..);
+    let line = doc.selection(view.id).primary().cursor_line(text);
+
+    let regions = if let Some(regions) = get_fold_regions(doc) {
+        regions
+    } else {
+        cx.editor
+            .set_error("No syntax tree or language configuration available for folding");
+        return;
+    };
+
+    let fold_state = doc.fold_state_mut(view.id).unwrap();
+    if fold_state.is_folded(line) {
+        fold_state.unfold(line);
+    } else if let Some(region) = fold::get_fold_at_line(&regions, line) {
+        fold_state.unfold(region.start_line);
+    }
+}
+
+/// Fold all foldable regions
+fn fold_all(cx: &mut Context) {
+    let (view, doc) = current!(cx.editor);
+    doc.ensure_view_init(view.id);
+
+    let regions = if let Some(regions) = get_fold_regions(doc) {
+        regions
+    } else {
+        cx.editor
+            .set_error("No syntax tree or language configuration available for folding");
+        return;
+    };
+
+    let view_id = view.id;
+    {
+        let fold_state = doc.fold_state_mut(view_id).unwrap();
+        fold_state.fold_all(&regions);
+    }
+
+    let line = doc.selection(view_id).primary().cursor_line(doc.text().slice(..));
+    if let Some(region) = fold::get_fold_at_line(&regions, line) {
+        if line != region.start_line {
+            let start_char = doc.text().line_to_char(region.start_line);
+            doc.set_selection(view_id, Selection::point(start_char));
+        }
+    }
+}
+
+/// Unfold all folded regions
+fn unfold_all(cx: &mut Context) {
+    let (view, doc) = current!(cx.editor);
+    doc.ensure_view_init(view.id);
+
+    let fold_state = doc.fold_state_mut(view.id).unwrap();
+    fold_state.unfold_all();
+}
+
+/// Recursively fold at cursor (fold all nested folds)
+fn fold_recursive(cx: &mut Context) {
+    let (view, doc) = current!(cx.editor);
+    doc.ensure_view_init(view.id);
+
+    let text = doc.text().slice(..);
+    let line = doc.selection(view.id).primary().cursor_line(text);
+
+    let regions = if let Some(regions) = get_fold_regions(doc) {
+        regions
+    } else {
+        cx.editor
+            .set_error("No syntax tree or language configuration available for folding");
+        return;
+    };
+
+    if let Some(region) = fold::get_fold_at_line(&regions, line) {
+        let view_id = view.id;
+        {
+            let fold_state = doc.fold_state_mut(view_id).unwrap();
+            fold_state.fold(region.start_line);
+            for r in &regions {
+                if r.start_line > region.start_line && r.end_line <= region.end_line {
+                    fold_state.fold(r.start_line);
+                }
+            }
+        }
+        if line != region.start_line {
+            let start_char = doc.text().line_to_char(region.start_line);
+            doc.set_selection(view_id, Selection::point(start_char));
+        }
+    } else {
+        cx.editor.set_error("No foldable region found at cursor");
+    }
+}
+
+/// Recursively unfold at cursor (unfold all nested folds)
+fn unfold_recursive(cx: &mut Context) {
+    let (view, doc) = current!(cx.editor);
+    doc.ensure_view_init(view.id);
+
+    let text = doc.text().slice(..);
+    let line = doc.selection(view.id).primary().cursor_line(text);
+
+    let regions = if let Some(regions) = get_fold_regions(doc) {
+        regions
+    } else {
+        cx.editor
+            .set_error("No syntax tree or language configuration available for folding");
+        return;
+    };
+
+    if let Some(region) = fold::get_fold_at_line(&regions, line) {
+        let fold_state = doc.fold_state_mut(view.id).unwrap();
+        fold_state.unfold(region.start_line);
+        for r in &regions {
+            if r.start_line > region.start_line && r.end_line <= region.end_line {
+                fold_state.unfold(r.start_line);
+            }
+        }
+    } else {
+        cx.editor.set_error("No foldable region found at cursor");
     }
 }

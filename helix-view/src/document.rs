@@ -208,6 +208,9 @@ pub struct Document {
 
     /// Annotations for LSP document color swatches
     pub color_swatches: Option<DocumentColorSwatches>,
+
+    /// Fold state for each view (stores folded line numbers)
+    pub(crate) folds: HashMap<ViewId, helix_core::fold::FoldState>,
     // NOTE: ideally this would live on the handler for color swatches. This is blocked on a
     // large refactor that would make `&mut Editor` available on the `DocumentDidChange` event.
     pub color_swatch_controller: TaskController,
@@ -730,6 +733,7 @@ impl Document {
             jump_labels: HashMap::new(),
             color_swatches: None,
             color_swatch_controller: TaskController::new(),
+            folds: HashMap::new(),
             syn_loader,
             previous_diagnostic_id: None,
             pull_diagnostic_controller: TaskController::new(),
@@ -1368,6 +1372,9 @@ impl Document {
         }
 
         self.view_data_mut(view_id);
+
+        // Initialize fold state for the view if not already present
+        self.folds.entry(view_id).or_default();
     }
 
     /// Mark document as recent used for MRU sorting
@@ -1380,6 +1387,17 @@ impl Document {
         self.selections.remove(&view_id);
         self.inlay_hints.remove(&view_id);
         self.jump_labels.remove(&view_id);
+        self.folds.remove(&view_id);
+    }
+
+    /// Get fold state for a view.
+    pub fn fold_state(&self, view_id: ViewId) -> Option<&helix_core::fold::FoldState> {
+        self.folds.get(&view_id)
+    }
+
+    /// Get mutable fold state for a view.
+    pub fn fold_state_mut(&mut self, view_id: ViewId) -> Option<&mut helix_core::fold::FoldState> {
+        self.folds.get_mut(&view_id)
     }
 
     /// Apply a [`Transaction`] to the [`Document`] to change its text.

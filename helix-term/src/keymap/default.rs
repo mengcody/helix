@@ -225,6 +225,14 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
         "space" => { "Space"
             "f" => file_picker,
             "F" => file_picker_in_current_directory,
+            "z" => { "Fold"
+                "f" => toggle_fold,
+                "F" => fold_recursive,
+                "o" => unfold,
+                "O" => unfold_recursive,
+                "a" => fold_all,
+                "A" => unfold_all,
+            },
             "e" => file_explorer,
             "E" => file_explorer_in_current_buffer_directory,
             "b" => buffer_picker,

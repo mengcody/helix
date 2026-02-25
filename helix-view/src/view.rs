@@ -1,6 +1,7 @@
 use crate::{
     align_view,
     annotations::diagnostics::InlineDiagnostics,
+    annotations::folds::{FoldAnnotations, FoldConfig},
     document::{DocumentColorSwatches, DocumentInlayHints},
     editor::{GutterConfig, GutterType},
     graphics::Rect,
@@ -493,6 +494,12 @@ impl View {
                 text_annotations.add_inline_annotations(color_swatches_padding, None);
             }
         }
+
+        text_annotations.add_line_annotation(Box::new(FoldAnnotations::new(
+            doc,
+            self.id,
+            FoldConfig::new(),
+        )));
 
         let width = self.inner_width(doc);
         let enable_cursor_line = self

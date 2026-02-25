@@ -171,6 +171,13 @@ pub trait LineAnnotation {
         line_end_visual_pos: Position,
         doc_line: usize,
     ) -> Position;
+
+    /// When at the end of `doc_line`, how many following document lines should be skipped
+    /// (e.g. because they are folded). The formatter will advance past that many newlines
+    /// and add virtual lines from `insert_virtual_lines` instead. Default is no skip.
+    fn lines_to_skip_after_line(&self, _doc_line: usize) -> Option<usize> {
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -420,5 +427,16 @@ impl<'a> TextAnnotations<'a> {
             };
         }
         virt_off.row
+    }
+
+    /// Maximum number of document lines to skip after the given doc line (e.g. folded region).
+    pub(crate) fn lines_to_skip_after_line(&self, doc_line: usize) -> usize {
+        let mut max_skip = 0;
+        for (_, layer) in &self.line_annotations {
+            if let Some(skip) = unsafe { layer.get().lines_to_skip_after_line(doc_line) } {
+                max_skip = max_skip.max(skip);
+            }
+        }
+        max_skip
     }
 }

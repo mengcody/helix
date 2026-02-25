@@ -1,0 +1,23 @@
+[
+  (function_declaration)
+  (function_expression)
+  (arrow_function)
+  (method_definition)
+  (generator_function_declaration)
+  (class_declaration)
+  (class)
+  (if_statement)
+  (for_statement)
+  (for_in_statement)
+  (while_statement)
+  (do_statement)
+  (switch_statement)
+  (try_statement)
+  (object)
+  (array)
+  (export_statement)
+  (import_statement)
+  (statement_block)
+  (comment)
+] @fold
+
