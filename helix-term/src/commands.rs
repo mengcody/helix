@@ -623,6 +623,8 @@ impl MappableCommand {
         unfold_all, "Unfold all folded regions",
         fold_recursive, "Recursively fold at cursor",
         unfold_recursive, "Recursively unfold at cursor",
+        fold_more, "Fold one more level (Vim zm style)",
+        unfold_more, "Unfold one more level (Vim zr style)",
     );
 }
 
@@ -754,6 +756,75 @@ fn move_impl(cx: &mut Context, move_fn: MoveFn, dir: Direction, behaviour: Movem
     doc.set_selection(view.id, selection);
 }
 
+fn move_impl_fold_aware(cx: &mut Context, move_fn: MoveFn, dir: Direction, behaviour: Movement) {
+    let count = cx.count();
+    let (view, doc) = current!(cx.editor);
+    let text = doc.text().slice(..);
+    let text_fmt = doc.text_format(view.inner_area(doc).width, None);
+    let mut annotations = view.text_annotations(doc, None);
+    let view_id = view.id;
+
+    let selection = doc.selection(view_id).clone().transform(|range| {
+        let moved = move_fn(
+            text,
+            range,
+            dir,
+            count,
+            behaviour,
+            &text_fmt,
+            &mut annotations,
+        );
+        adjust_range_for_folds(doc, view_id, text, moved, dir, behaviour)
+    });
+    drop(annotations);
+    doc.set_selection(view_id, selection);
+}
+
+fn adjust_range_for_folds(
+    doc: &Document,
+    view_id: ViewId,
+    text: RopeSlice,
+    mut range: Range,
+    dir: Direction,
+    behaviour: Movement,
+) -> Range {
+    let Some(regions) = get_fold_regions(doc) else {
+        return range;
+    };
+    let Some(fold_state) = doc.fold_state(view_id) else {
+        return range;
+    };
+    if fold_state.folded.is_empty() {
+        return range;
+    }
+
+    loop {
+        let line = range.cursor_line(text);
+        let Some(region) = regions.iter().find(|region| {
+            line > region.start_line
+                && line <= region.end_line
+                && fold_state.is_folded(region.start_line)
+        }) else {
+            break;
+        };
+
+        let target_line = match dir {
+            Direction::Forward => (region.end_line + 1).min(text.len_lines().saturating_sub(1)),
+            Direction::Backward => region.start_line,
+        };
+        if target_line == line {
+            break;
+        }
+
+        let old_visual_position = range.old_visual_position;
+        let mut adjusted = range.put_cursor(text, text.line_to_char(target_line), behaviour == Movement::Extend);
+        adjusted.old_visual_position = old_visual_position;
+        range = adjusted;
+    }
+
+    range
+}
+
 use helix_core::movement::{move_horizontally, move_vertically};
 
 fn move_char_left(cx: &mut Context) {
@@ -761,19 +832,44 @@ fn move_char_left(cx: &mut Context) {
 }
 
 fn move_char_right(cx: &mut Context) {
-    move_impl(cx, move_horizontally, Direction::Forward, Movement::Move)
+    if cx.editor.mode != Mode::Normal {
+        move_impl(cx, move_horizontally, Direction::Forward, Movement::Move);
+        return;
+    }
+
+    let count = cx.count();
+    let (view, doc) = current!(cx.editor);
+    let text = doc.text().slice(..);
+    let selection = doc.selection(view.id).clone().transform(|range| {
+        let mut pos = range.cursor(text);
+        let line = text.char_to_line(pos);
+        let line_start = text.line_to_char(line);
+        let line_end = line_end_char_index(&text, line);
+        let line_last_char = graphemes::prev_grapheme_boundary(text, line_end).max(line_start);
+
+        for _ in 0..count {
+            let next = graphemes::next_grapheme_boundary(text, pos);
+            if next > line_last_char {
+                break;
+            }
+            pos = next;
+        }
+
+        range.put_cursor(text, pos, false)
+    });
+    doc.set_selection(view.id, selection);
 }
 
 fn move_line_up(cx: &mut Context) {
-    move_impl(cx, move_vertically, Direction::Backward, Movement::Move)
+    move_impl_fold_aware(cx, move_vertically, Direction::Backward, Movement::Move)
 }
 
 fn move_line_down(cx: &mut Context) {
-    move_impl(cx, move_vertically, Direction::Forward, Movement::Move)
+    move_impl_fold_aware(cx, move_vertically, Direction::Forward, Movement::Move)
 }
 
 fn move_visual_line_up(cx: &mut Context) {
-    move_impl(
+    move_impl_fold_aware(
         cx,
         move_vertically_visual,
         Direction::Backward,
@@ -782,7 +878,7 @@ fn move_visual_line_up(cx: &mut Context) {
 }
 
 fn move_visual_line_down(cx: &mut Context) {
-    move_impl(
+    move_impl_fold_aware(
         cx,
         move_vertically_visual,
         Direction::Forward,
@@ -799,15 +895,15 @@ fn extend_char_right(cx: &mut Context) {
 }
 
 fn extend_line_up(cx: &mut Context) {
-    move_impl(cx, move_vertically, Direction::Backward, Movement::Extend)
+    move_impl_fold_aware(cx, move_vertically, Direction::Backward, Movement::Extend)
 }
 
 fn extend_line_down(cx: &mut Context) {
-    move_impl(cx, move_vertically, Direction::Forward, Movement::Extend)
+    move_impl_fold_aware(cx, move_vertically, Direction::Forward, Movement::Extend)
 }
 
 fn extend_visual_line_up(cx: &mut Context) {
-    move_impl(
+    move_impl_fold_aware(
         cx,
         move_vertically_visual,
         Direction::Backward,
@@ -816,7 +912,7 @@ fn extend_visual_line_up(cx: &mut Context) {
 }
 
 fn extend_visual_line_down(cx: &mut Context) {
-    move_impl(
+    move_impl_fold_aware(
         cx,
         move_vertically_visual,
         Direction::Forward,
@@ -6992,6 +7088,33 @@ fn get_fold_regions(doc: &helix_view::Document) -> Option<Vec<fold::FoldRegion>>
     ))
 }
 
+fn max_fold_depth(regions: &[fold::FoldRegion]) -> usize {
+    regions.iter().map(|region| region.depth).max().unwrap_or(0)
+}
+
+fn is_descendant_fold(parent: &fold::FoldRegion, child: &fold::FoldRegion) -> bool {
+    let is_same_region =
+        parent.start_line == child.start_line && parent.end_line == child.end_line;
+    !is_same_region
+        && child.start_line >= parent.start_line
+        && child.end_line <= parent.end_line
+}
+
+fn move_primary_cursor_out_of_fold(doc: &mut Document, view_id: ViewId, regions: &[fold::FoldRegion]) {
+    let text = doc.text().slice(..);
+    let line = doc.selection(view_id).primary().cursor_line(text);
+    let Some(fold_state) = doc.fold_state(view_id) else {
+        return;
+    };
+    let Some(region) = regions.iter().find(|region| {
+        line > region.start_line && line <= region.end_line && fold_state.is_folded(region.start_line)
+    }) else {
+        return;
+    };
+    let start_char = doc.text().line_to_char(region.start_line);
+    doc.set_selection(view_id, Selection::point(start_char));
+}
+
 /// Toggle fold at cursor position
 fn toggle_fold(cx: &mut Context) {
     let (view, doc) = current!(cx.editor);
@@ -7094,16 +7217,9 @@ fn fold_all(cx: &mut Context) {
     let view_id = view.id;
     {
         let fold_state = doc.fold_state_mut(view_id).unwrap();
-        fold_state.fold_all(&regions);
+        fold_state.fold_to_level(&regions, 0);
     }
-
-    let line = doc.selection(view_id).primary().cursor_line(doc.text().slice(..));
-    if let Some(region) = fold::get_fold_at_line(&regions, line) {
-        if line != region.start_line {
-            let start_char = doc.text().line_to_char(region.start_line);
-            doc.set_selection(view_id, Selection::point(start_char));
-        }
-    }
+    move_primary_cursor_out_of_fold(doc, view_id, &regions);
 }
 
 /// Unfold all folded regions
@@ -7111,8 +7227,14 @@ fn unfold_all(cx: &mut Context) {
     let (view, doc) = current!(cx.editor);
     doc.ensure_view_init(view.id);
 
+    let Some(regions) = get_fold_regions(doc) else {
+        cx.editor
+            .set_error("No syntax tree or language configuration available for folding");
+        return;
+    };
+
     let fold_state = doc.fold_state_mut(view.id).unwrap();
-    fold_state.unfold_all();
+    fold_state.fold_to_level(&regions, max_fold_depth(&regions));
 }
 
 /// Recursively fold at cursor (fold all nested folds)
@@ -7137,7 +7259,7 @@ fn fold_recursive(cx: &mut Context) {
             let fold_state = doc.fold_state_mut(view_id).unwrap();
             fold_state.fold(region.start_line);
             for r in &regions {
-                if r.start_line > region.start_line && r.end_line <= region.end_line {
+                if is_descendant_fold(&region, r) {
                     fold_state.fold(r.start_line);
                 }
             }
@@ -7171,11 +7293,59 @@ fn unfold_recursive(cx: &mut Context) {
         let fold_state = doc.fold_state_mut(view.id).unwrap();
         fold_state.unfold(region.start_line);
         for r in &regions {
-            if r.start_line > region.start_line && r.end_line <= region.end_line {
+            if is_descendant_fold(&region, r) {
                 fold_state.unfold(r.start_line);
             }
         }
     } else {
         cx.editor.set_error("No foldable region found at cursor");
     }
+}
+
+/// Fold one more level globally (Vim `zm`)
+fn fold_more(cx: &mut Context) {
+    let count = cx.count();
+    let (view, doc) = current!(cx.editor);
+    doc.ensure_view_init(view.id);
+    let Some(regions) = get_fold_regions(doc) else {
+        cx.editor
+            .set_error("No syntax tree or language configuration available for folding");
+        return;
+    };
+    if regions.is_empty() {
+        cx.editor.set_error("No foldable region found");
+        return;
+    }
+
+    let view_id = view.id;
+    let max_level = max_fold_depth(&regions);
+    {
+        let fold_state = doc.fold_state_mut(view_id).unwrap();
+        let current_level = fold_state.level().unwrap_or(max_level);
+        let new_level = current_level.saturating_sub(count);
+        fold_state.fold_to_level(&regions, new_level);
+    }
+    move_primary_cursor_out_of_fold(doc, view_id, &regions);
+}
+
+/// Unfold one more level globally (Vim `zr`)
+fn unfold_more(cx: &mut Context) {
+    let count = cx.count();
+    let (view, doc) = current!(cx.editor);
+    doc.ensure_view_init(view.id);
+    let Some(regions) = get_fold_regions(doc) else {
+        cx.editor
+            .set_error("No syntax tree or language configuration available for folding");
+        return;
+    };
+    if regions.is_empty() {
+        cx.editor.set_error("No foldable region found");
+        return;
+    }
+
+    let max_level = max_fold_depth(&regions);
+    let fold_state = doc.fold_state_mut(view.id).unwrap();
+    let current_level = fold_state.level().unwrap_or(max_level);
+    let new_level = (current_level + count).min(max_level);
+    fold_state.fold_to_level(&regions, new_level);
 }

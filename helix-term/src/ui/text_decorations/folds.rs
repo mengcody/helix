@@ -1,5 +1,6 @@
 use helix_core::fold::{self, FoldRegion};
 use helix_core::Position;
+use helix_view::graphics::Rect;
 use helix_view::theme::Style;
 use helix_view::{Document, Theme, ViewId};
 
@@ -54,9 +55,29 @@ impl<'a> FoldDecoration<'a> {
     fn get_fold_region(&self, line: usize) -> Option<&FoldRegion> {
         self.regions.iter().find(|r| r.start_line == line)
     }
+
+    fn fold_overlay_text(&self) -> &'static str {
+        " …"
+    }
 }
 
 impl Decoration for FoldDecoration<'_> {
+    fn decorate_line(&mut self, renderer: &mut TextRenderer, pos: LinePos) {
+        if !pos.first_visual_line || !self.is_folded(pos.doc_line) {
+            return;
+        }
+
+        renderer.set_style(
+            Rect {
+                x: 0,
+                y: pos.visual_line,
+                width: renderer.viewport.width,
+                height: 1,
+            },
+            self.style,
+        );
+    }
+
     fn render_virt_lines(
         &mut self,
         renderer: &mut TextRenderer,
@@ -67,12 +88,11 @@ impl Decoration for FoldDecoration<'_> {
             return Position::new(0, 0);
         }
 
-        let Some(region) = self.get_fold_region(pos.doc_line) else {
+        let Some(_region) = self.get_fold_region(pos.doc_line) else {
             return Position::new(0, 0);
         };
 
-        let hidden_lines = region.end_line - region.start_line;
-        let overlay = format!(" ▶ {} lines ", hidden_lines);
+        let overlay = self.fold_overlay_text();
 
         let draw_col = (virt_off.col + 1) as u16;
         let width = renderer.viewport.width;
@@ -85,7 +105,7 @@ impl Decoration for FoldDecoration<'_> {
         let (end_col, _) = renderer.set_string_truncated(
             renderer.viewport.x + draw_col,
             pos.visual_line,
-            &overlay,
+            overlay,
             width.saturating_sub(draw_col) as usize,
             |_| style,
             true,

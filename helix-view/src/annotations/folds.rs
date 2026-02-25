@@ -1,7 +1,7 @@
 //! Fold annotations for rendering folded code regions.
 
 use helix_core::doc_formatter::FormattedGrapheme;
-use helix_core::fold::{FoldRegion, FoldState};
+use helix_core::fold::{FoldKind, FoldRegion, FoldState};
 use helix_core::text_annotations::LineAnnotation;
 use helix_core::Position;
 
@@ -81,9 +81,28 @@ impl<'a> FoldAnnotations<'a> {
 
     /// Get the fold region that contains a line.
     fn get_fold_at_line(&self, line: usize) -> Option<&FoldRegion> {
-        self.regions
-            .iter()
-            .find(|r| line >= r.start_line && line <= r.end_line)
+        self.regions.iter().find(|r| line == r.start_line)
+    }
+
+    fn should_keep_end_line_visible(&self, region: &FoldRegion) -> bool {
+        if region.kind != FoldKind::Syntax {
+            return false;
+        }
+
+        let text = self.doc.text().slice(..);
+        if region.end_line >= text.len_lines() {
+            return false;
+        }
+        let end_line = text
+            .line(region.end_line)
+            .chars()
+            .filter(|c| *c != '\n' && *c != '\r')
+            .collect::<String>();
+        let trimmed = end_line.trim();
+        matches!(
+            trimmed,
+            "}" | "};" | "}," | "]" | "];" | "]," | ")" | ");" | "),"
+        )
     }
 
     /// Get the next interesting position (where a fold starts).
@@ -126,7 +145,17 @@ impl LineAnnotation for FoldAnnotations<'_> {
         if !self.is_fold_start(doc_line) {
             return None;
         }
-        self.get_fold_at_line(doc_line).map(|r| r.end_line - r.start_line)
+        let lines_to_skip = self
+            .get_fold_at_line(doc_line)
+            .map(|region| {
+                let full_skip = region.end_line.saturating_sub(region.start_line);
+                if self.should_keep_end_line_visible(region) {
+                    full_skip.saturating_sub(1)
+                } else {
+                    full_skip
+                }
+            })
+            .unwrap_or(0);
+        (lines_to_skip > 0).then_some(lines_to_skip)
     }
 }
-

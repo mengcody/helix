@@ -465,6 +465,13 @@ impl<'t> Iterator for DocumentFormatter<'t> {
             self.visual_pos.col += 1;
             let skip = self.annotations.lines_to_skip_after_line(self.line_pos);
             if skip > 0 && !grapheme.is_virtual() {
+                // Folding conceals a document range. Any buffered graphemes/inline annotation
+                // fragments belong to the concealed range and must be discarded.
+                self.peeked_grapheme = None;
+                self.word_buf.clear();
+                self.word_i = 0;
+                self.inline_annotation_graphemes = None;
+
                 // Advance past folded lines: consume graphemes until we've seen `skip` newlines
                 let mut newlines_seen = 0usize;
                 while newlines_seen < skip {
@@ -474,8 +481,10 @@ impl<'t> Iterator for DocumentFormatter<'t> {
                     self.char_pos += g.len_chars();
                     newlines_seen += g.chars().filter(|&c| c == '\n').count();
                 }
-                // We were at line_pos (fold start); we skipped skip lines, so now at start of line_pos + skip + 1
-                self.line_pos += skip + 1;
+                // Reposition annotation iterators to the new char position after concealment.
+                self.annotations.reset_pos(self.char_pos);
+                // We were at line_pos (fold start); now at start of next visible line.
+                self.line_pos += newlines_seen + 1;
             }
             let virtual_lines =
                 self.annotations

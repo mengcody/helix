@@ -15,6 +15,7 @@ use crate::{
 
 use helix_core::{
     diagnostic::NumberOrString,
+    fold,
     graphemes::{next_grapheme_boundary, prev_grapheme_boundary},
     movement::Direction,
     syntax::{self, OverlayHighlights},
@@ -25,7 +26,7 @@ use helix_core::{
 use helix_view::{
     annotations::diagnostics::DiagnosticFilter,
     document::{Mode, SCRATCH_BUFFER_NAME},
-    editor::{CompleteAction, CursorShapeConfig},
+    editor::{CompleteAction, CursorShapeConfig, GutterType},
     graphics::{Color, CursorKind, Modifier, Rect, Style},
     input::{KeyEvent, MouseButton, MouseEvent, MouseEventKind},
     keyboard::{KeyCode, KeyModifiers},
@@ -117,7 +118,7 @@ impl EditorView {
         }
 
         let syntax_highlighter =
-            Self::doc_syntax_highlighter(doc, view_offset.anchor, inner.height, &loader);
+            Self::doc_syntax_highlighter(doc, view.id, view_offset.anchor, inner.height, &loader);
         let mut overlays = Vec::new();
 
         overlays.push(Self::overlay_syntax_highlights(
@@ -133,7 +134,14 @@ impl EditorView {
             .unwrap_or(config.rainbow_brackets)
         {
             if let Some(overlay) =
-                Self::doc_rainbow_highlights(doc, view_offset.anchor, inner.height, theme, &loader)
+                Self::doc_rainbow_highlights(
+                    doc,
+                    view.id,
+                    view_offset.anchor,
+                    inner.height,
+                    theme,
+                    &loader,
+                )
             {
                 overlays.push(overlay);
             }
@@ -290,6 +298,7 @@ impl EditorView {
     /// directly to enable rendering syntax highlighted docs anywhere (eg. picker preview)
     pub fn doc_syntax_highlighter<'editor>(
         doc: &'editor Document,
+        view_id: helix_view::ViewId,
         anchor: usize,
         height: u16,
         loader: &'editor syntax::Loader,
@@ -297,7 +306,13 @@ impl EditorView {
         let syntax = doc.syntax()?;
         let text = doc.text().slice(..);
         let row = text.char_to_line(anchor.min(text.len_chars()));
-        let range = Self::viewport_byte_range(text, row, height);
+        let mut range = Self::viewport_byte_range(text, row, height);
+        if doc
+            .fold_state(view_id)
+            .is_some_and(|fold_state| !fold_state.folded.is_empty())
+        {
+            range.end = text.len_bytes();
+        }
         let range = range.start as u32..range.end as u32;
 
         let highlighter = syntax.highlighter(text, loader, range);
@@ -321,6 +336,7 @@ impl EditorView {
 
     pub fn doc_rainbow_highlights(
         doc: &Document,
+        view_id: helix_view::ViewId,
         anchor: usize,
         height: u16,
         theme: &Theme,
@@ -329,7 +345,13 @@ impl EditorView {
         let syntax = doc.syntax()?;
         let text = doc.text().slice(..);
         let row = text.char_to_line(anchor.min(text.len_chars()));
-        let visible_range = Self::viewport_byte_range(text, row, height);
+        let mut visible_range = Self::viewport_byte_range(text, row, height);
+        if doc
+            .fold_state(view_id)
+            .is_some_and(|fold_state| !fold_state.folded.is_empty())
+        {
+            visible_range.end = text.len_bytes();
+        }
         let start = syntax::child_for_byte_range(
             &syntax.tree().root_node(),
             visible_range.start as u32..visible_range.end as u32,
@@ -657,11 +679,16 @@ impl EditorView {
         decoration_manager: &mut DecorationManager<'d>,
     ) {
         let text = doc.text().slice(..);
+        let gutters = view.gutters();
         let cursors: Rc<[_]> = doc
             .selection(view.id)
             .iter()
             .map(|range| range.cursor_line(text))
             .collect();
+        let folded_lines: Rc<[_]> = doc
+            .fold_state(view.id)
+            .map(|state| state.folded.clone().into())
+            .unwrap_or_else(|| Vec::new().into());
 
         let mut offset = 0;
 
@@ -669,13 +696,21 @@ impl EditorView {
         let gutter_selected_style = theme.get("ui.gutter.selected");
         let gutter_style_virtual = theme.get("ui.gutter.virtual");
         let gutter_selected_style_virtual = theme.get("ui.gutter.selected.virtual");
+        let fold_marker_style = theme
+            .try_get("ui.virtual.fold")
+            .unwrap_or_else(|| theme.get("ui.linenr.selected"));
 
-        for gutter_type in view.gutters() {
+        for (index, gutter_type) in gutters.iter().copied().enumerate() {
+            let draw_fold_marker = matches!(gutter_type, GutterType::Spacer)
+                && !gutters[(index + 1)..]
+                    .iter()
+                    .any(|g| matches!(g, GutterType::Spacer));
             let mut gutter = gutter_type.style(editor, doc, view, theme, is_focused);
             let width = gutter_type.width(view, doc);
             // avoid lots of small allocations by reusing a text buffer for each line
             let mut text = String::with_capacity(width);
             let cursors = cursors.clone();
+            let folded_lines = folded_lines.clone();
             let gutter_decoration = move |renderer: &mut TextRenderer, pos: LinePos| {
                 // TODO handle softwrap in gutters
                 let selected = cursors.contains(&pos.doc_line);
@@ -702,6 +737,20 @@ impl EditorView {
                             height: 1,
                         },
                         gutter_style,
+                    );
+                }
+
+                if draw_fold_marker
+                    && pos.first_visual_line
+                    && width > 0
+                    && folded_lines.contains(&pos.doc_line)
+                {
+                    renderer.set_stringn(
+                        x + width.saturating_sub(1) as u16,
+                        y,
+                        "›",
+                        1,
+                        gutter_style.patch(fold_marker_style),
                     );
                 }
                 text.clear();
@@ -778,8 +827,36 @@ impl EditorView {
     /// Apply the highlighting on the lines where a cursor is active
     pub fn cursorline(doc: &Document, view: &View, theme: &Theme) -> impl Decoration {
         let text = doc.text().slice(..);
+        let folded_regions = doc
+            .syntax
+            .as_ref()
+            .and_then(|syntax| {
+                let language_name = doc.language_name()?;
+                let grammar_name = doc
+                    .language_config()
+                    .and_then(|config| config.grammar.as_deref())
+                    .unwrap_or(language_name);
+                Some(fold::get_foldable_ranges(
+                    syntax,
+                    text,
+                    language_name,
+                    grammar_name,
+                ))
+            })
+            .unwrap_or_default();
+        let fold_state = doc.fold_state(view.id);
+        let normalize_line = |line: usize| {
+            folded_regions
+                .iter()
+                .find(|region| {
+                    line > region.start_line
+                        && line <= region.end_line
+                        && fold_state.is_some_and(|state| state.is_folded(region.start_line))
+                })
+                .map_or(line, |region| region.start_line)
+        };
         // TODO only highlight the visual line that contains the cursor instead of the full visual line
-        let primary_line = doc.selection(view.id).primary().cursor_line(text);
+        let primary_line = normalize_line(doc.selection(view.id).primary().cursor_line(text));
 
         // The secondary_lines do contain the primary_line, it doesn't matter
         // as the else-if clause in the loop later won't test for the
@@ -787,11 +864,13 @@ impl EditorView {
         // It's used inside a loop so the collect isn't needless:
         // https://github.com/rust-lang/rust-clippy/issues/6164
         #[allow(clippy::needless_collect)]
-        let secondary_lines: Vec<_> = doc
+        let mut secondary_lines: Vec<_> = doc
             .selection(view.id)
             .iter()
-            .map(|range| range.cursor_line(text))
+            .map(|range| normalize_line(range.cursor_line(text)))
             .collect();
+        secondary_lines.sort_unstable();
+        secondary_lines.dedup();
 
         let primary_style = theme.get("ui.cursorline.primary");
         let secondary_style = theme.get("ui.cursorline.secondary");

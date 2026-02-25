@@ -5,6 +5,7 @@
 
 use helix_loader::grammar::get_language;
 use ropey::RopeSlice;
+use std::cmp::Reverse;
 use tree_house::tree_sitter::{query::Query, RopeInput};
 
 use crate::syntax::{self, Syntax};
@@ -99,13 +100,12 @@ pub fn get_foldable_ranges(
             let end_line = source.byte_to_line((byte_range.end as usize).saturating_sub(1));
 
             if end_line > start_line {
-                let depth = count_ancestor_folds(&node);
                 let kind = FoldKind::from_node_type(node.kind());
                 regions.push(FoldRegion {
                     start_line,
                     end_line,
                     kind,
-                    depth,
+                    depth: 0,
                 });
             }
         }
@@ -117,29 +117,32 @@ pub fn get_foldable_ranges(
     // Remove exact duplicates (same start and end line) but keep nested regions
     regions.dedup_by(|a, b| a.start_line == b.start_line && a.end_line == b.end_line);
 
+    assign_fold_depths(&mut regions);
+
     regions
 }
 
-/// Count the number of ancestor fold nodes for depth tracking.
-#[allow(unused_variables)]
-fn count_ancestor_folds(node: &tree_house::tree_sitter::Node) -> usize {
-    let mut depth = 0;
-    let mut current = node.parent();
+/// Assign nesting depth based on fold regions rather than raw AST parent depth.
+///
+/// Regions are expected to be sorted by `start_line ASC, end_line DESC`.
+fn assign_fold_depths(regions: &mut [FoldRegion]) {
+    let mut active_ancestors: Vec<(usize, usize)> = Vec::new();
 
-    let node_start = node.start_byte();
-
-    while let Some(parent) = current {
-        let parent_start = parent.start_byte();
-        let parent_end = parent.end_byte();
-
-        // Check if parent contains the node (meaning node is inside parent)
-        if parent_start <= node_start && parent_end >= node_start {
-            depth += 1;
+    for region in regions.iter_mut() {
+        while let Some((ancestor_start, ancestor_end)) = active_ancestors.last() {
+            let starts_after_ancestor = region.start_line > *ancestor_end;
+            let not_contained_by_ancestor = region.end_line > *ancestor_end;
+            let same_span = region.start_line == *ancestor_start && region.end_line == *ancestor_end;
+            if starts_after_ancestor || not_contained_by_ancestor || same_span {
+                active_ancestors.pop();
+            } else {
+                break;
+            }
         }
-        current = parent.parent();
-    }
 
-    depth
+        region.depth = active_ancestors.len() + 1;
+        active_ancestors.push((region.start_line, region.end_line));
+    }
 }
 
 /// Fold state for a single view.
@@ -147,12 +150,17 @@ fn count_ancestor_folds(node: &tree_house::tree_sitter::Node) -> usize {
 pub struct FoldState {
     /// Currently folded regions (by start line).
     pub folded: Vec<usize>,
+    /// Current fold level if folds are managed via level-based commands.
+    pub fold_level: Option<usize>,
 }
 
 impl FoldState {
     /// Create a new fold state.
     pub fn new() -> Self {
-        Self { folded: Vec::new() }
+        Self {
+            folded: Vec::new(),
+            fold_level: None,
+        }
     }
 
     /// Check if a line is folded.
@@ -162,6 +170,7 @@ impl FoldState {
 
     /// Toggle fold state for a line.
     pub fn toggle(&mut self, line: usize) -> bool {
+        self.fold_level = None;
         if let Some(pos) = self.folded.iter().position(|&l| l == line) {
             self.folded.remove(pos);
             false
@@ -173,6 +182,7 @@ impl FoldState {
 
     /// Fold a line.
     pub fn fold(&mut self, line: usize) {
+        self.fold_level = None;
         if !self.folded.contains(&line) {
             self.folded.push(line);
             self.folded.sort();
@@ -181,6 +191,7 @@ impl FoldState {
 
     /// Unfold a line.
     pub fn unfold(&mut self, line: usize) {
+        self.fold_level = None;
         if let Some(pos) = self.folded.iter().position(|&l| l == line) {
             self.folded.remove(pos);
         }
@@ -188,12 +199,31 @@ impl FoldState {
 
     /// Unfold all lines.
     pub fn unfold_all(&mut self) {
+        self.fold_level = None;
         self.folded.clear();
     }
 
     /// Fold all provided regions.
     pub fn fold_all(&mut self, regions: &[FoldRegion]) {
+        self.fold_level = None;
         self.folded = regions.iter().map(|r| r.start_line).collect();
+    }
+
+    /// Fold to a specific level (Vim-like foldlevel semantics).
+    /// Regions deeper than `level` are folded; shallower/equal are unfolded.
+    pub fn fold_to_level(&mut self, regions: &[FoldRegion], level: usize) {
+        self.fold_level = Some(level);
+        self.folded = regions
+            .iter()
+            .filter(|region| region.depth > level)
+            .map(|region| region.start_line)
+            .collect();
+        self.folded.sort_unstable();
+        self.folded.dedup();
+    }
+
+    pub fn level(&self) -> Option<usize> {
+        self.fold_level
     }
 }
 
@@ -201,7 +231,9 @@ impl FoldState {
 pub fn get_fold_at_line(regions: &[FoldRegion], line: usize) -> Option<FoldRegion> {
     regions
         .iter()
-        .find(|r| line >= r.start_line && line <= r.end_line)
+        .filter(|r| line >= r.start_line && line <= r.end_line)
+        // Prefer the innermost containing fold.
+        .max_by_key(|r| (r.start_line, Reverse(r.end_line)))
         .cloned()
 }
 
@@ -233,6 +265,7 @@ mod tests {
         let mut state = FoldState::new();
 
         assert!(!state.is_folded(10));
+        assert_eq!(state.level(), None);
 
         state.fold(10);
         assert!(state.is_folded(10));
@@ -245,5 +278,87 @@ mod tests {
 
         state.toggle(10);
         assert!(!state.is_folded(10));
+        assert_eq!(state.level(), None);
+
+        let regions = vec![
+            FoldRegion {
+                start_line: 1,
+                end_line: 5,
+                kind: FoldKind::Syntax,
+                depth: 1,
+            },
+            FoldRegion {
+                start_line: 2,
+                end_line: 4,
+                kind: FoldKind::Syntax,
+                depth: 2,
+            },
+        ];
+        state.fold_to_level(&regions, 1);
+        assert_eq!(state.level(), Some(1));
+        assert!(!state.is_folded(1));
+        assert!(state.is_folded(2));
+    }
+
+    #[test]
+    fn test_assign_fold_depths_uses_fold_hierarchy() {
+        let mut regions = vec![
+            FoldRegion {
+                start_line: 0,
+                end_line: 20,
+                kind: FoldKind::Syntax,
+                depth: 0,
+            },
+            FoldRegion {
+                start_line: 3,
+                end_line: 10,
+                kind: FoldKind::Syntax,
+                depth: 0,
+            },
+            FoldRegion {
+                start_line: 5,
+                end_line: 8,
+                kind: FoldKind::Syntax,
+                depth: 0,
+            },
+            FoldRegion {
+                start_line: 12,
+                end_line: 18,
+                kind: FoldKind::Syntax,
+                depth: 0,
+            },
+        ];
+
+        assign_fold_depths(&mut regions);
+        let depths: Vec<usize> = regions.iter().map(|r| r.depth).collect();
+        assert_eq!(depths, vec![1, 2, 3, 2]);
+    }
+
+    #[test]
+    fn test_get_fold_at_line_prefers_innermost_region() {
+        let regions = vec![
+            FoldRegion {
+                start_line: 0,
+                end_line: 20,
+                kind: FoldKind::Syntax,
+                depth: 1,
+            },
+            FoldRegion {
+                start_line: 3,
+                end_line: 10,
+                kind: FoldKind::Syntax,
+                depth: 2,
+            },
+            FoldRegion {
+                start_line: 5,
+                end_line: 8,
+                kind: FoldKind::Syntax,
+                depth: 3,
+            },
+        ];
+
+        let selected = get_fold_at_line(&regions, 6).expect("expected fold at line");
+        assert_eq!(selected.start_line, 5);
+        assert_eq!(selected.end_line, 8);
     }
 }
