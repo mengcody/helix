@@ -26,6 +26,13 @@ async fn normal_mode_l_stops_at_line_end() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn normal_mode_h_stops_at_line_start() -> anyhow::Result<()> {
+    test(("#[a|]#b\ncd", "h", "#[a|]#b\ncd")).await?;
+    test(("ab#[|]#\ncd", "3h", "#[a|]#b\ncd")).await?;
+    Ok(())
+}
+
 /// Range direction is preserved when escaping insert mode to normal
 #[tokio::test(flavor = "multi_thread")]
 async fn insert_to_normal_mode_cursor_position() -> anyhow::Result<()> {

@@ -72,16 +72,20 @@ impl<'a> FoldAnnotations<'a> {
         self.doc.folds.get(&self.view_id)
     }
 
-    /// Check if a line is a fold start and is folded.
-    fn is_fold_start(&self, line: usize) -> bool {
-        self.fold_state()
-            .map(|state| state.is_folded(line))
-            .unwrap_or(false)
-    }
-
-    /// Get the fold region that contains a line.
-    fn get_fold_at_line(&self, line: usize) -> Option<&FoldRegion> {
-        self.regions.iter().find(|r| line == r.start_line)
+    /// Get a folded region that contains `line`.
+    ///
+    /// Prefer the outermost containing region so concealed content remains
+    /// hidden even when rendering starts from inside a folded block.
+    fn folded_region_containing_line(&self, line: usize) -> Option<&FoldRegion> {
+        let fold_state = self.fold_state()?;
+        self.regions
+            .iter()
+            .filter(|region| {
+                line >= region.start_line
+                    && line <= region.end_line
+                    && fold_state.is_folded(region.start_line)
+            })
+            .min_by_key(|region| region.start_line)
     }
 
     fn should_keep_end_line_visible(&self, region: &FoldRegion) -> bool {
@@ -142,20 +146,16 @@ impl LineAnnotation for FoldAnnotations<'_> {
     }
 
     fn lines_to_skip_after_line(&self, doc_line: usize) -> Option<usize> {
-        if !self.is_fold_start(doc_line) {
+        let Some(region) = self.folded_region_containing_line(doc_line) else {
             return None;
-        }
-        let lines_to_skip = self
-            .get_fold_at_line(doc_line)
-            .map(|region| {
-                let full_skip = region.end_line.saturating_sub(region.start_line);
-                if self.should_keep_end_line_visible(region) {
-                    full_skip.saturating_sub(1)
-                } else {
-                    full_skip
-                }
-            })
-            .unwrap_or(0);
+        };
+
+        let skip_until = if self.should_keep_end_line_visible(region) {
+            region.end_line.saturating_sub(1)
+        } else {
+            region.end_line
+        };
+        let lines_to_skip = skip_until.saturating_sub(doc_line);
         (lines_to_skip > 0).then_some(lines_to_skip)
     }
 }

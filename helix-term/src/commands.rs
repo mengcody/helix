@@ -828,7 +828,30 @@ fn adjust_range_for_folds(
 use helix_core::movement::{move_horizontally, move_vertically};
 
 fn move_char_left(cx: &mut Context) {
-    move_impl(cx, move_horizontally, Direction::Backward, Movement::Move)
+    if cx.editor.mode != Mode::Normal {
+        move_impl(cx, move_horizontally, Direction::Backward, Movement::Move);
+        return;
+    }
+
+    let count = cx.count();
+    let (view, doc) = current!(cx.editor);
+    let text = doc.text().slice(..);
+    let selection = doc.selection(view.id).clone().transform(|range| {
+        let mut pos = range.cursor(text);
+        let line = text.char_to_line(pos);
+        let line_start = text.line_to_char(line);
+
+        for _ in 0..count {
+            let prev = graphemes::prev_grapheme_boundary(text, pos);
+            if prev < line_start {
+                break;
+            }
+            pos = prev;
+        }
+
+        range.put_cursor(text, pos, false)
+    });
+    doc.set_selection(view.id, selection);
 }
 
 fn move_char_right(cx: &mut Context) {

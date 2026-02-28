@@ -1,0 +1,43 @@
+# Author: Codex Assistant
+
+inherits = "base16_default_dark"
+
+"ui.cursor" = { fg = "base00", bg = "base0B" }
+"ui.cursor.primary" = { fg = "base00", bg = "base0D" }
+"ui.cursorline" = { bg = "base01" }
+"ui.selection" = { bg = "base02" }
+"ui.statusline" = { fg = "base04", bg = "base01" }
+"ui.statusline.normal" = { fg = "base00", bg = "base0B" }
+"ui.statusline.insert" = { fg = "base00", bg = "base0D" }
+"ui.statusline.select" = { fg = "base00", bg = "base0A" }
+"ui.virtual.indent-guide" = { fg = "base01" }
+
+"comment" = { fg = "base03" }
+"keyword" = "base0D"
+"function" = "base0C"
+"type" = "base0A"
+"variable" = "base05"
+"constant" = "base09"
+"string" = "base0B"
+"special" = "base0F"
+"diff.plus" = "base0B"
+"diff.minus" = "base08"
+"diff.delta" = "base0D"
+
+[palette]
+base00 = "#020b02" # background
+base01 = "#0b1a0b" # panels / statusline bg
+base02 = "#123012" # selection
+base03 = "#1f5a1f" # comments / guides
+base04 = "#58a558" # dim fg
+base05 = "#87d787" # default fg
+base06 = "#b6ffb6" # bright fg
+base07 = "#d6ffd6" # brightest fg
+base08 = "#4ea34e" # red channel replacement (soft green)
+base09 = "#72c772" # constants
+base0A = "#9ce65a" # types
+base0B = "#00ff41" # strings / primary matrix green
+base0C = "#37ff8b" # functions
+base0D = "#66ff66" # keywords / accents
+base0E = "#7dffb3" # secondary accents
+base0F = "#c2ff7a" # special
