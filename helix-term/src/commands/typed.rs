@@ -2492,28 +2492,11 @@ fn run_shell_command(
     }
 
     let shell = cx.editor.config().shell.clone();
-    let args = args.join(" ");
+    let cmd = args.join(" ");
 
-    let callback = async move {
-        let output = shell_impl_async(&shell, &args, None).await?;
-        let call: job::Callback = Callback::EditorCompositor(Box::new(
-            move |editor: &mut Editor, compositor: &mut Compositor| {
-                if !output.trim().is_empty() {
-                    let contents = ui::Markdown::new(
-                        format!("```sh\n{}\n```", output.trim_end()),
-                        editor.syn_loader.clone(),
-                    );
-                    let popup = Popup::new("shell", contents).position(Some(
-                        helix_core::Position::new(editor.cursor().0.unwrap_or_default().row, 2),
-                    ));
-                    compositor.replace_or_push("shell", popup);
-                }
-                editor.set_status("Command run");
-            },
-        ));
-        Ok(call)
-    };
-    cx.jobs.callback(callback);
+    cx.block_try_flush_writes()?;
+    cx.jobs
+        .callback(async move { Ok(Callback::Shell { shell, cmd }) });
 
     Ok(())
 }

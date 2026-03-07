@@ -33,6 +33,7 @@ use log::{debug, error, info, warn};
 use std::{
     io::{stdin, IsTerminal},
     path::Path,
+    process::Command,
     sync::Arc,
 };
 
@@ -104,6 +105,70 @@ fn setup_integration_logging() {
 }
 
 impl Application {
+    async fn handle_job_callback(&mut self, call: anyhow::Result<Option<crate::job::Callback>>) {
+        match call {
+            Ok(None) => {}
+            Ok(Some(crate::job::Callback::EditorCompositor(call))) => {
+                call(&mut self.editor, &mut self.compositor);
+            }
+            Ok(Some(crate::job::Callback::Editor(call))) => {
+                call(&mut self.editor);
+            }
+            Ok(Some(crate::job::Callback::Shell { shell, cmd })) => {
+                if let Err(err) = self.run_shell_command(shell, cmd) {
+                    self.editor
+                        .set_error(format!("Shell command failed: {err}"));
+                }
+            }
+            Err(err) => {
+                self.editor.set_error(format!("Async job failed: {err}"));
+            }
+        }
+    }
+
+    fn reclaim_terminal(&mut self) -> std::io::Result<()> {
+        for retries in 1..=10 {
+            match self.terminal.claim() {
+                Ok(()) => break,
+                Err(err) if retries == 10 => return Err(err),
+                Err(_) => continue,
+            }
+        }
+
+        let area = self.terminal.size();
+        self.compositor.resize(area);
+        self.terminal.clear()?;
+        Ok(())
+    }
+
+    fn run_shell_command(&mut self, shell: Vec<String>, cmd: String) -> anyhow::Result<()> {
+        anyhow::ensure!(!shell.is_empty(), "No shell set");
+
+        self.restore_term()?;
+
+        let status = tokio::task::block_in_place(|| {
+            Command::new(&shell[0]).args(&shell[1..]).arg(&cmd).status()
+        });
+
+        let reclaim_result = self.reclaim_terminal();
+
+        let status = status?;
+        reclaim_result?;
+
+        if status.success() {
+            self.editor.set_status("Command run");
+        } else {
+            match status.code() {
+                Some(code) => self
+                    .editor
+                    .set_error(format!("Shell command failed: status {code}")),
+                None => self.editor.set_error("Shell command failed"),
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn new(args: Args, config: Config, lang_loader: syntax::Loader) -> Result<Self, Error> {
         #[cfg(feature = "integration")]
         setup_integration_logging();
@@ -339,7 +404,7 @@ impl Application {
                     self.handle_terminal_events(event).await;
                 }
                 Some(callback) = self.jobs.callbacks.recv() => {
-                    self.jobs.handle_callback(&mut self.editor, &mut self.compositor, Ok(Some(callback)));
+                    self.handle_job_callback(Ok(Some(callback))).await;
                     self.render().await;
                 }
                 Some(msg) = self.jobs.status_messages.recv() => {
@@ -354,7 +419,7 @@ impl Application {
                     helix_event::request_redraw();
                 }
                 Some(callback) = self.jobs.wait_futures.next() => {
-                    self.jobs.handle_callback(&mut self.editor, &mut self.compositor, callback);
+                    self.handle_job_callback(callback).await;
                     self.render().await;
                 }
                 event = self.editor.wait_event() => {
