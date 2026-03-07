@@ -112,7 +112,11 @@ pub fn get_foldable_ranges(
     }
 
     // Sort by start line, then by end line descending (larger regions first)
-    regions.sort_by(|a, b| a.start_line.cmp(&b.start_line).then(b.end_line.cmp(&a.end_line)));
+    regions.sort_by(|a, b| {
+        a.start_line
+            .cmp(&b.start_line)
+            .then(b.end_line.cmp(&a.end_line))
+    });
 
     // Remove exact duplicates (same start and end line) but keep nested regions
     regions.dedup_by(|a, b| a.start_line == b.start_line && a.end_line == b.end_line);
@@ -132,7 +136,8 @@ fn assign_fold_depths(regions: &mut [FoldRegion]) {
         while let Some((ancestor_start, ancestor_end)) = active_ancestors.last() {
             let starts_after_ancestor = region.start_line > *ancestor_end;
             let not_contained_by_ancestor = region.end_line > *ancestor_end;
-            let same_span = region.start_line == *ancestor_start && region.end_line == *ancestor_end;
+            let same_span =
+                region.start_line == *ancestor_start && region.end_line == *ancestor_end;
             if starts_after_ancestor || not_contained_by_ancestor || same_span {
                 active_ancestors.pop();
             } else {
@@ -254,9 +259,15 @@ mod tests {
     fn test_fold_kind_from_node_type() {
         assert_eq!(FoldKind::from_node_type("comment"), FoldKind::Comment);
         assert_eq!(FoldKind::from_node_type("block_comment"), FoldKind::Comment);
-        assert_eq!(FoldKind::from_node_type("import_statement"), FoldKind::Imports);
+        assert_eq!(
+            FoldKind::from_node_type("import_statement"),
+            FoldKind::Imports
+        );
         assert_eq!(FoldKind::from_node_type("include"), FoldKind::Imports);
-        assert_eq!(FoldKind::from_node_type("function_declaration"), FoldKind::Syntax);
+        assert_eq!(
+            FoldKind::from_node_type("function_declaration"),
+            FoldKind::Syntax
+        );
         assert_eq!(FoldKind::from_node_type("if_statement"), FoldKind::Syntax);
     }
 

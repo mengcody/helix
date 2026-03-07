@@ -117,6 +117,12 @@ impl EditorView {
             decorations.add_decoration(line_decoration);
         }
 
+        if is_focused && editor.config().inline_git_blame {
+            decorations.add_decoration(text_decorations::InlineGitBlame::new(
+                editor, doc, view, theme,
+            ));
+        }
+
         let syntax_highlighter =
             Self::doc_syntax_highlighter(doc, view.id, view_offset.anchor, inner.height, &loader);
         let mut overlays = Vec::new();
@@ -133,16 +139,14 @@ impl EditorView {
             .and_then(|config| config.rainbow_brackets)
             .unwrap_or(config.rainbow_brackets)
         {
-            if let Some(overlay) =
-                Self::doc_rainbow_highlights(
-                    doc,
-                    view.id,
-                    view_offset.anchor,
-                    inner.height,
-                    theme,
-                    &loader,
-                )
-            {
+            if let Some(overlay) = Self::doc_rainbow_highlights(
+                doc,
+                view.id,
+                view_offset.anchor,
+                inner.height,
+                theme,
+                &loader,
+            ) {
                 overlays.push(overlay);
             }
         }
@@ -204,9 +208,7 @@ impl EditorView {
             inline_diagnostic_config,
             config.end_of_line_diagnostics,
         ));
-        decorations.add_decoration(text_decorations::FoldDecoration::new(
-            doc, view.id, theme,
-        ));
+        decorations.add_decoration(text_decorations::FoldDecoration::new(doc, view.id, theme));
         render_document(
             surface,
             inner,

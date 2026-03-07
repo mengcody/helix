@@ -1,8 +1,10 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use arc_swap::ArcSwap;
+use chrono::{DateTime, FixedOffset, Utc};
 use gix::filter::plumbing::driver::apply::Delay;
 use std::io::Read;
 use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 
 use gix::bstr::ByteSlice;
@@ -77,6 +79,41 @@ pub fn get_current_head_name(file: &Path) -> Result<Arc<ArcSwap<Box<str>>>> {
     };
 
     Ok(Arc::new(ArcSwap::from_pointee(name.into_boxed_str())))
+}
+
+pub fn get_line_blame(file: &Path, line: usize) -> Result<Box<str>> {
+    debug_assert!(!file.exists() || file.is_file());
+    debug_assert!(file.is_absolute());
+    let file = gix::path::realpath(file).context("resolve symlinks")?;
+
+    let repo_dir = get_repo_dir(&file)?;
+    let repo = open_repo(repo_dir)
+        .context("failed to open git repo")?
+        .to_thread_local();
+    let work_dir = repo.workdir().context("working tree not found")?;
+    let rel_path = file
+        .strip_prefix(work_dir)
+        .context("file is outside of the git worktree")?;
+
+    let line = line + 1;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(work_dir)
+        .args(["blame", "--line-porcelain", "-L"])
+        .arg(format!("{line},{line}"))
+        .arg("--")
+        .arg(rel_path)
+        .output()
+        .context("failed to execute git blame")?;
+
+    if !output.status.success() {
+        bail!(
+            "git blame failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    parse_line_blame(&String::from_utf8_lossy(&output.stdout))
 }
 
 pub fn for_each_changed_file(cwd: &Path, f: impl Fn(Result<FileChange>) -> bool) -> Result<()> {
@@ -216,4 +253,72 @@ fn find_file_in_commit(repo: &Repository, commit: &Commit, file: &Path) -> Resul
         // found a file
         EntryKind::Blob | EntryKind::BlobExecutable => Ok(tree_entry.object_id()),
     }
+}
+
+fn parse_line_blame(output: &str) -> Result<Box<str>> {
+    let mut author = None;
+    let mut author_time = None;
+    let mut author_tz = None;
+    let mut summary = None;
+
+    for line in output.lines() {
+        if let Some(value) = line.strip_prefix("author ") {
+            author = Some(value.trim());
+        } else if let Some(value) = line.strip_prefix("author-time ") {
+            author_time = value.trim().parse::<i64>().ok();
+        } else if let Some(value) = line.strip_prefix("author-tz ") {
+            author_tz = Some(value.trim());
+        } else if let Some(value) = line.strip_prefix("summary ") {
+            summary = Some(value.trim());
+        }
+    }
+
+    let author = author.filter(|value| !value.is_empty());
+    let timestamp = author_time
+        .zip(author_tz)
+        .and_then(|(unix_seconds, tz)| format_git_timestamp(unix_seconds, tz));
+    let summary = summary.filter(|value| !value.is_empty());
+
+    match (author, timestamp.as_deref(), summary) {
+        (Some(author), Some(timestamp), Some(summary)) => {
+            Ok(format!("{timestamp}, {author}: {summary}").into_boxed_str())
+        }
+        (Some(author), Some(timestamp), None) => {
+            Ok(format!("{timestamp}, {author}").into_boxed_str())
+        }
+        (Some(author), None, Some(summary)) => Ok(format!("{author}: {summary}").into_boxed_str()),
+        (Some(author), None, None) => Ok(author.to_owned().into_boxed_str()),
+        (None, Some(timestamp), Some(summary)) => {
+            Ok(format!("{timestamp}: {summary}").into_boxed_str())
+        }
+        (None, Some(timestamp), None) => Ok(timestamp.to_owned().into_boxed_str()),
+        (None, None, Some(summary)) => Ok(summary.to_owned().into_boxed_str()),
+        (None, None, None) => Err(anyhow!("missing blame metadata")),
+    }
+}
+
+fn format_git_timestamp(unix_seconds: i64, tz: &str) -> Option<String> {
+    let offset = parse_git_tz_offset(tz)?;
+    let dt = DateTime::<Utc>::from_timestamp(unix_seconds, 0)?;
+    Some(
+        dt.with_timezone(&offset)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string(),
+    )
+}
+
+fn parse_git_tz_offset(tz: &str) -> Option<FixedOffset> {
+    if tz.len() != 5 {
+        return None;
+    }
+
+    let sign = match &tz[..1] {
+        "+" => 1,
+        "-" => -1,
+        _ => return None,
+    };
+    let hours = tz[1..3].parse::<i32>().ok()?;
+    let minutes = tz[3..5].parse::<i32>().ok()?;
+
+    FixedOffset::east_opt(sign * (hours * 3600 + minutes * 60))
 }

@@ -15,7 +15,7 @@ use helix_core::text_annotations::{InlineAnnotation, Overlay};
 use helix_event::TaskController;
 use helix_lsp::util::lsp_pos_to_pos;
 use helix_stdx::faccess::{copy_metadata, readonly};
-use helix_vcs::{DiffHandle, DiffProviderRegistry};
+use helix_vcs::{DiffHandle, DiffProviderRegistry, LineBlameStatus};
 use once_cell::sync::OnceCell;
 use thiserror;
 
@@ -198,6 +198,7 @@ pub struct Document {
 
     diff_handle: Option<DiffHandle>,
     version_control_head: Option<Arc<ArcSwap<Box<str>>>>,
+    line_blame: Arc<ArcSwap<LineBlameStatus>>,
 
     // when document was used for most-recent-used buffer picker
     pub focused_at: std::time::Instant,
@@ -728,6 +729,7 @@ impl Document {
             diff_handle: None,
             config,
             version_control_head: None,
+            line_blame: Arc::new(ArcSwap::from_pointee(LineBlameStatus::default())),
             focused_at: std::time::Instant::now(),
             readonly: false,
             jump_labels: HashMap::new(),
@@ -1261,6 +1263,7 @@ impl Document {
         }
 
         self.version_control_head = provider_registry.get_current_head_name(&path);
+        self.reset_line_blame();
 
         Ok(())
     }
@@ -1289,6 +1292,7 @@ impl Document {
         // `take` to remove any prior relative path that may have existed.
         // This will get set in `relative_path()`.
         self.relative_path.take();
+        self.reset_line_blame();
 
         // if parent doesn't exist we still want to open the document
         // and error out when document is saved
@@ -1481,6 +1485,7 @@ impl Document {
         if let Some(diff_handle) = &self.diff_handle {
             diff_handle.update_document(self.text.clone(), false);
         }
+        self.reset_line_blame();
 
         // map diagnostics over changes too
         changes.update_positions(self.diagnostics.iter_mut().map(|diagnostic| {
@@ -1918,6 +1923,14 @@ impl Document {
         version_control_head: Option<Arc<ArcSwap<Box<str>>>>,
     ) {
         self.version_control_head = version_control_head;
+    }
+
+    pub fn line_blame(&self) -> Arc<ArcSwap<LineBlameStatus>> {
+        self.line_blame.clone()
+    }
+
+    pub fn reset_line_blame(&self) {
+        self.line_blame.store(Arc::new(LineBlameStatus::default()));
     }
 
     #[inline]

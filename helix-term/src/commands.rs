@@ -817,7 +817,11 @@ fn adjust_range_for_folds(
         }
 
         let old_visual_position = range.old_visual_position;
-        let mut adjusted = range.put_cursor(text, text.line_to_char(target_line), behaviour == Movement::Extend);
+        let mut adjusted = range.put_cursor(
+            text,
+            text.line_to_char(target_line),
+            behaviour == Movement::Extend,
+        );
         adjusted.old_visual_position = old_visual_position;
         range = adjusted;
     }
@@ -7116,21 +7120,24 @@ fn max_fold_depth(regions: &[fold::FoldRegion]) -> usize {
 }
 
 fn is_descendant_fold(parent: &fold::FoldRegion, child: &fold::FoldRegion) -> bool {
-    let is_same_region =
-        parent.start_line == child.start_line && parent.end_line == child.end_line;
-    !is_same_region
-        && child.start_line >= parent.start_line
-        && child.end_line <= parent.end_line
+    let is_same_region = parent.start_line == child.start_line && parent.end_line == child.end_line;
+    !is_same_region && child.start_line >= parent.start_line && child.end_line <= parent.end_line
 }
 
-fn move_primary_cursor_out_of_fold(doc: &mut Document, view_id: ViewId, regions: &[fold::FoldRegion]) {
+fn move_primary_cursor_out_of_fold(
+    doc: &mut Document,
+    view_id: ViewId,
+    regions: &[fold::FoldRegion],
+) {
     let text = doc.text().slice(..);
     let line = doc.selection(view_id).primary().cursor_line(text);
     let Some(fold_state) = doc.fold_state(view_id) else {
         return;
     };
     let Some(region) = regions.iter().find(|region| {
-        line > region.start_line && line <= region.end_line && fold_state.is_folded(region.start_line)
+        line > region.start_line
+            && line <= region.end_line
+            && fold_state.is_folded(region.start_line)
     }) else {
         return;
     };

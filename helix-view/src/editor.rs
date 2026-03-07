@@ -364,6 +364,8 @@ pub struct Config {
     pub file_explorer: FileExplorerConfig,
     /// Configuration of the statusline elements
     pub statusline: StatusLineConfig,
+    /// Whether to show git blame information inline for the current cursor line.
+    pub inline_git_blame: bool,
     /// Shape for cursor in each mode
     pub cursor_shape: CursorShapeConfig,
     /// Set to `true` to override automatic detection of terminal truecolor support in the event of a false negative. Defaults to `false`.
@@ -709,6 +711,9 @@ pub enum StatusLineElement {
 
     /// Current version control information
     VersionControl,
+
+    /// Git blame information for the current line
+    GitBlame,
 
     /// Indicator for selected register
     Register,
@@ -1111,6 +1116,7 @@ impl Default for Config {
             file_picker: FilePickerConfig::default(),
             file_explorer: FileExplorerConfig::default(),
             statusline: StatusLineConfig::default(),
+            inline_git_blame: false,
             cursor_shape: CursorShapeConfig::default(),
             true_color: false,
             undercurl: false,

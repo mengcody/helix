@@ -79,6 +79,21 @@ fn modified_file() {
     assert_eq!(git::get_diff_base(&file).unwrap(), Vec::from(contents));
 }
 
+#[test]
+fn line_blame() {
+    let temp_git = empty_git_repo();
+    let file = temp_git.path().join("file.txt");
+    File::create(&file)
+        .unwrap()
+        .write_all(b"first line\nsecond line\n")
+        .unwrap();
+    create_commit(temp_git.path(), true);
+
+    let blame = git::get_line_blame(&file, 1).unwrap();
+
+    assert_eq!(&*blame, "2000-01-01 00:00:00, author: message");
+}
+
 /// Test that `get_file_head` does not return content for a directory.
 /// This is important to correctly cover cases where a directory is removed and replaced by a file.
 /// If the contents of the directory object were returned a diff between a path and the directory children would be produced.

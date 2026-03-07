@@ -155,6 +155,7 @@ where
         helix_view::editor::StatusLineElement::Separator => render_separator,
         helix_view::editor::StatusLineElement::Spacer => render_spacer,
         helix_view::editor::StatusLineElement::VersionControl => render_version_control,
+        helix_view::editor::StatusLineElement::GitBlame => render_git_blame,
         helix_view::editor::StatusLineElement::Register => render_register,
         helix_view::editor::StatusLineElement::CurrentWorkingDirectory => render_cwd,
     }
@@ -543,6 +544,13 @@ where
         .to_string();
 
     write(context, head.into());
+}
+
+fn render_git_blame<'a, F>(context: &mut RenderContext<'a>, write: F)
+where
+    F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
+{
+    let _ = (context, write);
 }
 
 fn render_register<'a, F>(context: &mut RenderContext<'a>, write: F)

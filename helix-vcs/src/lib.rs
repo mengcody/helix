@@ -20,6 +20,13 @@ mod status;
 
 pub use status::FileChange;
 
+#[derive(Debug, Clone, Default)]
+pub struct LineBlameStatus {
+    pub line: Option<usize>,
+    pub loading: bool,
+    pub message: Option<Box<str>>,
+}
+
 /// Contains all active diff providers. Diff providers are compiled in via features. Currently
 /// only `git` is supported.
 #[derive(Clone)]
@@ -52,6 +59,24 @@ impl DiffProviderRegistry {
                 Err(err) => {
                     log::debug!("{err:#?}");
                     log::debug!("failed to obtain current head name for {}", file.display());
+                    None
+                }
+            })
+    }
+
+    /// Get blame information for a single line in the given file.
+    pub fn get_line_blame(&self, file: &Path, line: usize) -> Option<Box<str>> {
+        self.providers
+            .iter()
+            .find_map(|provider| match provider.get_line_blame(file, line) {
+                Ok(res) => Some(res),
+                Err(err) => {
+                    log::debug!("{err:#?}");
+                    log::debug!(
+                        "failed to obtain blame info for {}:{}",
+                        file.display(),
+                        line + 1
+                    );
                     None
                 }
             })
@@ -114,6 +139,14 @@ impl DiffProvider {
         match self {
             #[cfg(feature = "git")]
             Self::Git => git::get_current_head_name(file),
+            Self::None => bail!("No diff support compiled in"),
+        }
+    }
+
+    fn get_line_blame(&self, file: &Path, line: usize) -> Result<Box<str>> {
+        match self {
+            #[cfg(feature = "git")]
+            Self::Git => git::get_line_blame(file, line),
             Self::None => bail!("No diff support compiled in"),
         }
     }

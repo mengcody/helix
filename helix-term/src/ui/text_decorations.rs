@@ -8,9 +8,11 @@ use crate::ui::document::{LinePos, TextRenderer};
 
 pub use diagnostics::InlineDiagnostics;
 pub use folds::FoldDecoration;
+pub use git_blame::InlineGitBlame;
 
 mod diagnostics;
 mod folds;
+mod git_blame;
 
 /// Decorations are the primary mechanism for extending the text rendering.
 ///
