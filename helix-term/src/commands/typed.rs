@@ -2514,23 +2514,33 @@ fn show_diff(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> a
         return Ok(());
     }
 
-    let Some(diff) = current_buffer_diff_text(cx.editor)? else {
+    let Some((source_path, diff)) = current_buffer_diff_text(cx.editor)? else {
         cx.editor.set_status("Current buffer has no changes");
         return Ok(());
     };
 
-    cx.editor.new_file(Action::VerticalSplit);
     let loader = cx.editor.syn_loader.load();
-    let (view, doc) = current!(cx.editor);
-    let transaction = Transaction::insert(doc.text(), doc.selection(view.id), diff.into())
-        .with_selection(Selection::point(0));
-    doc.apply(&transaction, view.id);
-    doc.append_changes_to_history(view);
-    doc.reset_modified();
-    doc.set_language_by_language_id("diff", &loader)?;
-    doc.readonly = true;
+    let existing = find_existing_diff_buffer(cx.editor, &source_path);
 
-    cx.editor.set_status("Opened diff in split buffer");
+    if let Some((doc_id, view_id)) = existing {
+        cx.editor.focus(view_id);
+        cx.editor.get_synced_view_id(doc_id);
+        let scrolloff = cx.editor.config().scrolloff;
+        let (view, doc) = current!(cx.editor);
+        replace_buffer_contents(doc, view, diff);
+        doc.set_language_by_language_id("diff", &loader)?;
+        doc.readonly = true;
+        view.ensure_cursor_in_view(doc, scrolloff);
+        cx.editor.set_status("Updated existing diff buffer");
+    } else {
+        cx.editor.new_file(Action::VerticalSplit);
+        let (view, doc) = current!(cx.editor);
+        replace_buffer_contents(doc, view, diff);
+        doc.set_language_by_language_id("diff", &loader)?;
+        doc.readonly = true;
+        cx.editor.set_status("Opened diff in split buffer");
+    }
+
     Ok(())
 }
 
@@ -2548,7 +2558,7 @@ pub(crate) fn diff_buffer_quit(editor: &mut Editor) -> bool {
     true
 }
 
-fn current_buffer_diff_text(editor: &Editor) -> anyhow::Result<Option<String>> {
+fn current_buffer_diff_text(editor: &Editor) -> anyhow::Result<Option<(String, String)>> {
     let doc = doc!(editor);
     let Some(handle) = doc.diff_handle() else {
         bail!("Diff is not available in the current buffer")
@@ -2564,12 +2574,49 @@ fn current_buffer_diff_text(editor: &Editor) -> anyhow::Result<Option<String>> {
         .map(|path| get_relative_path(path).display().to_string())
         .unwrap_or_else(|| SCRATCH_BUFFER_NAME.to_string());
     let hunks: Vec<_> = (0..diff.len()).map(|idx| diff.nth_hunk(idx)).collect();
-    Ok(Some(format_diff_text(
-        &path,
-        diff.diff_base(),
-        diff.doc(),
-        &hunks,
+    Ok(Some((
+        path.clone(),
+        format_diff_text(&path, diff.diff_base(), diff.doc(), &hunks),
     )))
+}
+
+fn find_existing_diff_buffer(editor: &Editor, source_path: &str) -> Option<(DocumentId, ViewId)> {
+    let doc_id = editor
+        .documents()
+        .find(|doc| diff_buffer_source_path(doc).as_deref() == Some(source_path))
+        .map(|doc| doc.id())?;
+
+    let view_id = editor
+        .tree
+        .views()
+        .find(|(view, _)| view.doc == doc_id)
+        .map(|(view, _)| view.id)?;
+
+    Some((doc_id, view_id))
+}
+
+fn diff_buffer_source_path(doc: &Document) -> Option<String> {
+    if !is_generated_diff_buffer(doc) {
+        return None;
+    }
+
+    let first_line = doc.text().line(0).to_string();
+    first_line
+        .trim_end_matches('\n')
+        .strip_prefix("--- a/")
+        .map(str::to_string)
+}
+
+fn replace_buffer_contents(doc: &mut Document, view: &mut View, contents: String) {
+    let text = doc.text().slice(..);
+    let transaction = Transaction::change(
+        doc.text(),
+        std::iter::once((0, text.len_chars(), Some(contents.into()))),
+    )
+    .with_selection(Selection::point(0));
+    doc.apply(&transaction, view.id);
+    doc.append_changes_to_history(view);
+    doc.reset_modified();
 }
 
 fn format_diff_text(path: &str, diff_base: &Rope, doc: &Rope, hunks: &[Hunk]) -> String {
