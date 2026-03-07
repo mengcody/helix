@@ -1027,6 +1027,13 @@ impl EditorView {
     }
 
     fn command_mode(&mut self, mode: Mode, cxt: &mut commands::Context, event: KeyEvent) {
+        if event == key!('q') && commands::typed::diff_buffer_quit(cxt.editor) {
+            self.pseudo_pending.clear();
+            cxt.editor.count = None;
+            cxt.editor.selected_register = None;
+            return;
+        }
+
         match (event, cxt.editor.count) {
             (key!('q'), None) if self.keymaps.pending().is_empty() => {
                 if !commands::typed::diff_buffer_quit(cxt.editor) {

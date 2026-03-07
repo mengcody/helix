@@ -1,6 +1,13 @@
 use std::fmt::Write;
 use std::io::BufReader;
 use std::ops::{self, Deref};
+use std::{
+    collections::hash_map::DefaultHasher,
+    fs,
+    hash::{Hash, Hasher},
+    path::{Path, PathBuf},
+    time::UNIX_EPOCH,
+};
 
 use crate::job::Job;
 
@@ -14,6 +21,8 @@ use helix_stdx::path::{get_relative_path, home_dir};
 use helix_view::document::{read_to_string, DEFAULT_LANGUAGE_NAME};
 use helix_view::editor::{CloseError, ConfigEvent};
 use helix_view::expansion;
+use imara_diff::{Algorithm, Diff, IndentHeuristic, IndentLevel, InternedInput};
+use once_cell::sync::Lazy;
 use serde_json::Value;
 use ui::completers::{self, Completer};
 
@@ -2514,70 +2523,113 @@ fn show_diff(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> a
         return Ok(());
     }
 
-    let Some((source_path, diff)) = current_buffer_diff_text(cx.editor)? else {
-        cx.editor.set_status("Current buffer has no changes");
-        return Ok(());
-    };
-
-    let loader = cx.editor.syn_loader.load();
-    let existing = find_existing_diff_buffer(cx.editor, &source_path);
-
-    if let Some((doc_id, view_id)) = existing {
-        cx.editor.focus(view_id);
-        cx.editor.get_synced_view_id(doc_id);
-        let scrolloff = cx.editor.config().scrolloff;
-        let (view, doc) = current!(cx.editor);
-        replace_buffer_contents(doc, view, diff);
-        doc.set_language_by_language_id("diff", &loader)?;
-        doc.readonly = true;
-        view.ensure_cursor_in_view(doc, scrolloff);
-        cx.editor.set_status("Updated existing diff buffer");
-    } else {
-        cx.editor.new_file(Action::VerticalSplit);
-        let (view, doc) = current!(cx.editor);
-        replace_buffer_contents(doc, view, diff);
-        doc.set_language_by_language_id("diff", &loader)?;
-        doc.readonly = true;
-        cx.editor.set_status("Opened diff in split buffer");
-    }
-
+    open_diff_picker(cx);
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum DiffNavigation {
+    NextHunk,
+    PrevHunk,
+    NextFile,
+    PrevFile,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct DiffPreviewCacheEntry {
+    stamp: DiffPreviewStamp,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum DiffPreviewStamp {
+    OpenDocument { version: i32 },
+    FileOnDisk { modified_ms: u128, len: u64 },
+    Missing,
+}
+
+static DIFF_PREVIEW_CACHE: Lazy<dashmap::DashMap<PathBuf, DiffPreviewCacheEntry>> =
+    Lazy::new(dashmap::DashMap::new);
+
 pub(crate) fn diff_buffer_quit(editor: &mut Editor) -> bool {
-    let view_id = {
+    let (doc_id, view_id, is_diff_buffer) = {
         let (view, doc) = current_ref!(editor);
-        if !is_generated_diff_buffer(doc) {
-            return false;
-        }
-        view.id
+        (doc.id(), view.id, is_generated_diff_buffer(doc))
     };
+    if !is_diff_buffer {
+        return false;
+    }
+
+    if editor.tree.views().count() <= 1 {
+        match editor.close_document(doc_id, true) {
+            Ok(()) => editor.set_status("Closed diff buffer"),
+            Err(_) => editor.set_error("Failed to close diff buffer"),
+        }
+        return true;
+    }
 
     editor.close(view_id);
     editor.set_status("Closed diff buffer");
     true
 }
 
-fn current_buffer_diff_text(editor: &Editor) -> anyhow::Result<Option<(String, String)>> {
-    let doc = doc!(editor);
-    let Some(handle) = doc.diff_handle() else {
-        bail!("Diff is not available in the current buffer")
+pub(crate) fn diff_buffer_navigate(editor: &mut Editor, navigation: DiffNavigation) -> bool {
+    if !is_generated_diff_buffer(doc!(editor)) {
+        return false;
+    }
+
+    match navigation {
+        DiffNavigation::NextHunk => jump_diff_hunk(editor, Direction::Forward),
+        DiffNavigation::PrevHunk => jump_diff_hunk(editor, Direction::Backward),
+        DiffNavigation::NextFile => cycle_diff_file(editor, Direction::Forward),
+        DiffNavigation::PrevFile => cycle_diff_file(editor, Direction::Backward),
+    }
+    true
+}
+
+fn changed_file_paths(editor: &Editor) -> anyhow::Result<Vec<PathBuf>> {
+    let cwd = helix_stdx::env::current_working_dir();
+    Ok(editor
+        .diff_providers
+        .changed_files(&cwd)?
+        .into_iter()
+        .map(|change| change.path().to_path_buf())
+        .collect())
+}
+
+fn format_diff_file_status(paths: &[PathBuf], current_idx: usize) -> String {
+    format!(
+        "Diff {}/{}: {}",
+        current_idx + 1,
+        paths.len(),
+        get_relative_path(&paths[current_idx]).display()
+    )
+}
+
+struct DiffBufferData {
+    source_path: String,
+    text: String,
+    preferred_hunk: Option<usize>,
+}
+
+fn diff_for_path(editor: &Editor, path: &Path) -> anyhow::Result<Option<DiffBufferData>> {
+    let source_path = get_relative_path(path).display().to_string();
+    let current = current_rope_for_path(editor, path)?;
+    let base = match diff_base_rope(editor, path) {
+        Some(base) => base,
+        None if current.len_chars() == 0 => return Ok(None),
+        None => Rope::default(),
     };
 
-    let diff = handle.load();
-    if diff.is_empty() {
+    let hunks = compute_hunks(&base, &current);
+    if hunks.is_empty() {
         return Ok(None);
     }
 
-    let path = doc
-        .path()
-        .map(|path| get_relative_path(path).display().to_string())
-        .unwrap_or_else(|| SCRATCH_BUFFER_NAME.to_string());
-    let hunks: Vec<_> = (0..diff.len()).map(|idx| diff.nth_hunk(idx)).collect();
-    Ok(Some((
-        path.clone(),
-        format_diff_text(&path, diff.diff_base(), diff.doc(), &hunks),
-    )))
+    Ok(Some(DiffBufferData {
+        preferred_hunk: preferred_hunk_for_path(editor, path, &hunks),
+        source_path: source_path.clone(),
+        text: format_unified_diff_text(&source_path, &base, &current, &hunks),
+    }))
 }
 
 fn find_existing_diff_buffer(editor: &Editor, source_path: &str) -> Option<(DocumentId, ViewId)> {
@@ -2595,16 +2647,49 @@ fn find_existing_diff_buffer(editor: &Editor, source_path: &str) -> Option<(Docu
     Some((doc_id, view_id))
 }
 
-fn diff_buffer_source_path(doc: &Document) -> Option<String> {
-    if !is_generated_diff_buffer(doc) {
+fn current_rope_for_path(editor: &Editor, path: &Path) -> anyhow::Result<Rope> {
+    if let Some(doc) = editor.document_by_path(path) {
+        return Ok(doc.text().clone());
+    }
+
+    match fs::read(path) {
+        Ok(bytes) => Ok(Rope::from(String::from_utf8_lossy(&bytes).into_owned())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Rope::default()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn diff_base_rope(editor: &Editor, path: &Path) -> Option<Rope> {
+    editor
+        .diff_providers
+        .get_diff_base(path)
+        .map(|bytes| Rope::from(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+fn preferred_hunk_for_path(editor: &Editor, path: &Path, hunks: &[Hunk]) -> Option<usize> {
+    let current = doc!(editor);
+    let current_path = current.path()?;
+    if current_path != path {
         return None;
     }
 
-    let first_line = doc.text().line(0).to_string();
-    first_line
-        .trim_end_matches('\n')
-        .strip_prefix("--- a/")
-        .map(str::to_string)
+    let view = view!(editor);
+    let text = current.text().slice(..);
+    let cursor_line = current.selection(view.id).primary().cursor_line(text) as u32;
+
+    hunks
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, hunk)| {
+            if cursor_line < hunk.before.start {
+                hunk.before.start - cursor_line
+            } else if cursor_line >= hunk.before.end {
+                cursor_line - hunk.before.end.saturating_sub(1)
+            } else {
+                0
+            }
+        })
+        .map(|(idx, _)| idx)
 }
 
 fn replace_buffer_contents(doc: &mut Document, view: &mut View, contents: String) {
@@ -2619,31 +2704,186 @@ fn replace_buffer_contents(doc: &mut Document, view: &mut View, contents: String
     doc.reset_modified();
 }
 
-fn format_diff_text(path: &str, diff_base: &Rope, doc: &Rope, hunks: &[Hunk]) -> String {
+fn focus_diff_hunk(
+    view: &mut View,
+    doc: &mut Document,
+    scrolloff: usize,
+    hunk_index: Option<usize>,
+) {
+    let text = doc.text().slice(..);
+    let hunk_lines: Vec<_> = text
+        .lines()
+        .enumerate()
+        .filter_map(|(idx, line)| line.to_string().starts_with("@@ ").then_some(idx))
+        .collect();
+    let target_line = hunk_index
+        .and_then(|idx| hunk_lines.get(idx).copied())
+        .or_else(|| hunk_lines.first().copied())
+        .unwrap_or(0);
+    let pos = text.line_to_char(target_line);
+    doc.set_selection(view.id, Selection::point(pos));
+    view.ensure_cursor_in_view_center(doc, scrolloff);
+}
+
+fn format_unified_diff_text(path: &str, diff_base: &Rope, doc: &Rope, hunks: &[Hunk]) -> String {
     let mut contents = String::new();
+    let added_lines: usize = hunks
+        .iter()
+        .map(|hunk| (hunk.after.end - hunk.after.start) as usize)
+        .sum();
+    let removed_lines: usize = hunks
+        .iter()
+        .map(|hunk| (hunk.before.end - hunk.before.start) as usize)
+        .sum();
+    let _ = writeln!(contents, "diff --git a/{path} b/{path}");
+    let _ = writeln!(
+        contents,
+        "{} hunk{}, +{}, -{}",
+        hunks.len(),
+        if hunks.len() == 1 { "" } else { "s" },
+        added_lines,
+        removed_lines
+    );
     let _ = writeln!(contents, "--- a/{path}");
     let _ = writeln!(contents, "+++ b/{path}");
+    let _ = writeln!(contents);
 
-    for hunk in hunks {
-        format_diff_hunk(&mut contents, diff_base, doc, hunk.clone());
+    let expanded_hunks = expand_hunks(diff_base, doc, hunks, 3);
+    let mut previous_before_end = 0;
+
+    for hunk in expanded_hunks {
+        if hunk.display_before.start > previous_before_end {
+            push_unchanged_marker(
+                &mut contents,
+                (hunk.display_before.start - previous_before_end) as usize,
+            );
+        }
+        let _ = writeln!(
+            contents,
+            "@@ -{} +{} @@",
+            format_unified_range(&hunk.display_before),
+            format_unified_range(&hunk.display_after)
+        );
+        let mut base_line = hunk.display_before.start;
+        let mut doc_line = hunk.display_after.start;
+        for raw in hunk.raw_hunks {
+            push_context_lines(
+                &mut contents,
+                diff_base,
+                doc,
+                base_line,
+                raw.before.start,
+                doc_line,
+            );
+            push_prefixed_lines(
+                &mut contents,
+                '-',
+                diff_base,
+                raw.before.start,
+                raw.before.end,
+            );
+            push_prefixed_lines(&mut contents, '+', doc, raw.after.start, raw.after.end);
+            base_line = raw.before.end;
+            doc_line = raw.after.end;
+        }
+        push_context_lines(
+            &mut contents,
+            diff_base,
+            doc,
+            base_line,
+            hunk.display_before.end,
+            doc_line,
+        );
+        let _ = writeln!(contents);
+        previous_before_end = hunk.display_before.end;
     }
 
+    let trailing_unchanged = diff_base
+        .len_lines()
+        .saturating_sub(previous_before_end as usize);
+    if trailing_unchanged > 0 {
+        push_unchanged_marker(&mut contents, trailing_unchanged);
+    }
     contents
+}
+
+fn diff_buffer_source_path(doc: &Document) -> Option<String> {
+    if doc.path().is_some() {
+        return None;
+    }
+
+    doc.text().lines().take(8).find_map(|line| {
+        line.to_string()
+            .trim_end_matches('\n')
+            .strip_prefix("diff --git a/")
+            .and_then(|line| line.split_once(" b/"))
+            .map(|(path, _)| path.to_string())
+    })
 }
 
 fn is_generated_diff_buffer(doc: &Document) -> bool {
     doc.path().is_none() && doc.language_name() == Some("diff")
 }
 
-fn format_diff_hunk(output: &mut String, diff_base: &Rope, doc: &Rope, hunk: Hunk) {
-    let _ = writeln!(
-        output,
-        "@@ -{} +{} @@",
-        format_unified_range(&hunk.before),
-        format_unified_range(&hunk.after)
-    );
-    push_prefixed_lines(output, '-', diff_base, hunk.before.start, hunk.before.end);
-    push_prefixed_lines(output, '+', doc, hunk.after.start, hunk.after.end);
+fn jump_diff_hunk(editor: &mut Editor, direction: Direction) {
+    let scrolloff = editor.config().scrolloff;
+    let (target, total, source_path, view_id) = {
+        let (view, doc) = current_ref!(editor);
+        let text = doc.text().slice(..);
+        let current_line = doc.selection(view.id).primary().cursor_line(text);
+        let hunks = diff_hunk_header_lines(doc);
+        let target = match direction {
+            Direction::Forward => hunks.iter().copied().find(|line| *line > current_line),
+            Direction::Backward => hunks
+                .iter()
+                .rev()
+                .copied()
+                .find(|line| *line < current_line),
+        };
+        (
+            target,
+            hunks.len(),
+            diff_buffer_source_path(doc).unwrap_or_default(),
+            view.id,
+        )
+    };
+
+    let Some(target_line) = target else {
+        editor.set_status(match direction {
+            Direction::Forward => "No next diff hunk",
+            Direction::Backward => "No previous diff hunk",
+        });
+        return;
+    };
+
+    let (view, doc) = current!(editor);
+    debug_assert_eq!(view.id, view_id);
+    let text = doc.text().slice(..);
+    let pos = text.line_to_char(target_line);
+    doc.set_selection(view.id, Selection::point(pos));
+    view.ensure_cursor_in_view(doc, scrolloff);
+    let hunk_index = diff_hunk_header_lines(doc)
+        .iter()
+        .position(|line| *line == target_line)
+        .map(|idx| idx + 1)
+        .unwrap_or(1);
+    editor.set_status(format!("Hunk {}/{} in {}", hunk_index, total, source_path));
+}
+
+fn diff_hunk_header_lines(doc: &Document) -> Vec<usize> {
+    doc.text()
+        .lines()
+        .enumerate()
+        .filter_map(|(idx, line)| line.to_string().starts_with("@@ ").then_some(idx))
+        .collect()
+}
+
+fn rope_line_text(text: &Rope, line_idx: usize) -> String {
+    text.line(line_idx)
+        .to_string()
+        .trim_end_matches('\n')
+        .trim_end_matches('\r')
+        .to_string()
 }
 
 fn format_unified_range(range: &std::ops::Range<u32>) -> String {
@@ -2653,7 +2893,6 @@ fn format_unified_range(range: &std::ops::Range<u32>) -> String {
         range.start + 1
     };
     let len = range.end - range.start;
-
     if len == 1 {
         start.to_string()
     } else {
@@ -2661,14 +2900,394 @@ fn format_unified_range(range: &std::ops::Range<u32>) -> String {
     }
 }
 
+fn push_context_lines(
+    output: &mut String,
+    before: &Rope,
+    after: &Rope,
+    before_start: u32,
+    before_end: u32,
+    after_start: u32,
+) {
+    for (before_idx, after_idx) in
+        (before_start as usize..before_end as usize).zip(after_start as usize..)
+    {
+        output.push(' ');
+        output.push_str(&rope_line_text(before, before_idx));
+        output.push('\n');
+        debug_assert_eq!(
+            rope_line_text(before, before_idx),
+            rope_line_text(after, after_idx)
+        );
+    }
+}
+
 fn push_prefixed_lines(output: &mut String, prefix: char, text: &Rope, start: u32, end: u32) {
     for line_idx in start as usize..end as usize {
-        let line = text.line(line_idx).to_string();
         output.push(prefix);
-        output.push_str(&line);
-        if !line.ends_with('\n') {
-            output.push('\n');
+        output.push_str(&rope_line_text(text, line_idx));
+        output.push('\n');
+    }
+}
+
+fn push_unchanged_marker(output: &mut String, count: usize) {
+    let noun = if count == 1 { "line" } else { "lines" };
+    let _ = writeln!(output, "... {count} unchanged {noun} ...");
+}
+
+struct ExpandedHunk<'a> {
+    display_before: std::ops::Range<u32>,
+    display_after: std::ops::Range<u32>,
+    raw_hunks: Vec<&'a Hunk>,
+}
+
+struct RopeLines<'a>(helix_core::RopeSlice<'a>);
+
+impl<'a> imara_diff::TokenSource for RopeLines<'a> {
+    type Token = helix_core::RopeSlice<'a>;
+    type Tokenizer = helix_core::ropey::iter::Lines<'a>;
+
+    fn tokenize(&self) -> Self::Tokenizer {
+        self.0.lines()
+    }
+
+    fn estimate_tokens(&self) -> u32 {
+        self.0.len_lines() as u32
+    }
+}
+
+fn compute_hunks(before: &Rope, after: &Rope) -> Vec<Hunk> {
+    let input = InternedInput::new(RopeLines(before.slice(..)), RopeLines(after.slice(..)));
+    let mut diff = Diff::compute(Algorithm::Histogram, &input);
+    diff.postprocess_with_heuristic(
+        &input,
+        IndentHeuristic::new(|token| IndentLevel::for_ascii_line(input.interner[token].bytes(), 4)),
+    );
+    diff.hunks().collect()
+}
+
+fn expand_hunks<'a>(
+    before: &Rope,
+    after: &Rope,
+    hunks: &'a [Hunk],
+    context: u32,
+) -> Vec<ExpandedHunk<'a>> {
+    let mut expanded: Vec<ExpandedHunk<'a>> = Vec::new();
+
+    for hunk in hunks {
+        let display_before = hunk.before.start.saturating_sub(context)
+            ..(hunk.before.end + context).min(before.len_lines() as u32);
+        let display_after = hunk.after.start.saturating_sub(context)
+            ..(hunk.after.end + context).min(after.len_lines() as u32);
+
+        if let Some(last) = expanded.last_mut() {
+            if display_before.start <= last.display_before.end
+                || display_after.start <= last.display_after.end
+            {
+                last.display_before.end = last.display_before.end.max(display_before.end);
+                last.display_after.end = last.display_after.end.max(display_after.end);
+                last.raw_hunks.push(hunk);
+                continue;
+            }
         }
+
+        expanded.push(ExpandedHunk {
+            display_before,
+            display_after,
+            raw_hunks: vec![hunk],
+        });
+    }
+
+    expanded
+}
+
+fn cycle_diff_file(editor: &mut Editor, direction: Direction) {
+    let Some(current_source_path) = diff_buffer_source_path(doc!(editor)) else {
+        return;
+    };
+
+    let paths = match changed_file_paths(editor) {
+        Ok(paths) => paths,
+        Err(err) => {
+            editor.set_error(err.to_string());
+            return;
+        }
+    };
+
+    if paths.is_empty() {
+        editor.set_status("No changed files available");
+        return;
+    }
+
+    let Some(current_idx) = paths
+        .iter()
+        .position(|path| get_relative_path(path).display().to_string() == current_source_path)
+    else {
+        editor.set_status("Current diff file is no longer in the change list");
+        return;
+    };
+
+    let next_idx = match direction {
+        Direction::Forward => (current_idx + 1) % paths.len(),
+        Direction::Backward => (current_idx + paths.len() - 1) % paths.len(),
+    };
+
+    if next_idx == current_idx {
+        editor.set_status("Only one changed file is available");
+        return;
+    }
+
+    if let Err(err) = replace_current_diff_buffer(editor, &paths[next_idx]) {
+        editor.set_error(err.to_string());
+    } else {
+        editor.set_status(format_diff_file_status(&paths, next_idx));
+    }
+}
+
+fn open_diff_buffer_for_path(
+    editor: &mut Editor,
+    path: &Path,
+    action: Action,
+) -> anyhow::Result<()> {
+    let Some(diff_data) = diff_for_path(editor, path)? else {
+        editor.set_status("Selected file has no textual diff");
+        return Ok(());
+    };
+    let DiffBufferData {
+        source_path,
+        text,
+        preferred_hunk,
+    } = diff_data;
+
+    let loader = editor.syn_loader.load();
+    let scrolloff = editor.config().scrolloff;
+    if let Some((doc_id, view_id)) = find_existing_diff_buffer(editor, &source_path) {
+        editor.focus(view_id);
+        editor.get_synced_view_id(doc_id);
+        let (view, doc) = current!(editor);
+        replace_buffer_contents(doc, view, text);
+        doc.set_language_by_language_id("diff", &loader)?;
+        doc.readonly = true;
+        focus_diff_hunk(view, doc, scrolloff, preferred_hunk);
+        let status = changed_file_paths(editor)
+            .ok()
+            .and_then(|paths| {
+                paths
+                    .iter()
+                    .position(|path| get_relative_path(path).display().to_string() == source_path)
+                    .map(|idx| format_diff_file_status(&paths, idx))
+            })
+            .unwrap_or_else(|| format!("Updated diff: {source_path}"));
+        editor.set_status(status);
+    } else {
+        editor.new_file(action);
+        let (view, doc) = current!(editor);
+        replace_buffer_contents(doc, view, text);
+        doc.set_language_by_language_id("diff", &loader)?;
+        doc.readonly = true;
+        focus_diff_hunk(view, doc, scrolloff, preferred_hunk);
+        let status = changed_file_paths(editor)
+            .ok()
+            .and_then(|paths| {
+                paths
+                    .iter()
+                    .position(|path| get_relative_path(path).display().to_string() == source_path)
+                    .map(|idx| format_diff_file_status(&paths, idx))
+            })
+            .unwrap_or_else(|| format!("Opened diff: {source_path}"));
+        editor.set_status(status);
+    }
+
+    Ok(())
+}
+
+fn replace_current_diff_buffer(editor: &mut Editor, path: &Path) -> anyhow::Result<()> {
+    let Some(diff_data) = diff_for_path(editor, path)? else {
+        editor.set_status("Selected file has no textual diff");
+        return Ok(());
+    };
+    let DiffBufferData {
+        text,
+        preferred_hunk,
+        ..
+    } = diff_data;
+
+    let loader = editor.syn_loader.load();
+    let scrolloff = editor.config().scrolloff;
+    let (view, doc) = current!(editor);
+    replace_buffer_contents(doc, view, text);
+    doc.set_language_by_language_id("diff", &loader)?;
+    doc.readonly = true;
+    focus_diff_hunk(view, doc, scrolloff, preferred_hunk);
+    Ok(())
+}
+
+fn open_diff_picker(cx: &mut compositor::Context) {
+    let cwd = helix_stdx::env::current_working_dir();
+    if !cwd.exists() {
+        cx.editor
+            .set_error("Current working directory does not exist");
+        return;
+    }
+    let callback = async move {
+        let call: job::Callback =
+            Callback::EditorCompositor(Box::new(move |editor, compositor| {
+                struct DiffPickerEntry {
+                    change: FileChange,
+                    preview_path: PathBuf,
+                }
+
+                struct FileChangeData {
+                    cwd: PathBuf,
+                    style_untracked: Style,
+                    style_modified: Style,
+                    style_conflict: Style,
+                    style_deleted: Style,
+                    style_renamed: Style,
+                }
+
+                let columns = [
+                    PickerColumn::new(
+                        "change",
+                        |entry: &DiffPickerEntry, data: &FileChangeData| {
+                            match &entry.change {
+                                FileChange::Untracked { .. } => {
+                                    Span::styled("+ untracked", data.style_untracked)
+                                }
+                                FileChange::Modified { .. } => {
+                                    Span::styled("~ modified", data.style_modified)
+                                }
+                                FileChange::Conflict { .. } => {
+                                    Span::styled("x conflict", data.style_conflict)
+                                }
+                                FileChange::Deleted { .. } => {
+                                    Span::styled("- deleted", data.style_deleted)
+                                }
+                                FileChange::Renamed { .. } => {
+                                    Span::styled("> renamed", data.style_renamed)
+                                }
+                            }
+                            .into()
+                        },
+                    ),
+                    PickerColumn::new("path", |entry: &DiffPickerEntry, data: &FileChangeData| {
+                        let display_path = |path: &PathBuf| {
+                            path.strip_prefix(&data.cwd)
+                                .unwrap_or(path)
+                                .display()
+                                .to_string()
+                        };
+                        match &entry.change {
+                            FileChange::Untracked { path } => display_path(path),
+                            FileChange::Modified { path } => display_path(path),
+                            FileChange::Conflict { path } => display_path(path),
+                            FileChange::Deleted { path } => display_path(path),
+                            FileChange::Renamed { from_path, to_path } => {
+                                format!("{} -> {}", display_path(from_path), display_path(to_path))
+                            }
+                        }
+                        .into()
+                    }),
+                ];
+
+                let picker = Picker::new(
+                    columns,
+                    1,
+                    [],
+                    FileChangeData {
+                        cwd: cwd.clone(),
+                        style_untracked: editor.theme.get("diff.plus"),
+                        style_modified: editor.theme.get("diff.delta"),
+                        style_conflict: editor.theme.get("diff.delta.conflict"),
+                        style_deleted: editor.theme.get("diff.minus"),
+                        style_renamed: editor.theme.get("diff.delta.moved"),
+                    },
+                    |cx, entry: &DiffPickerEntry, action| {
+                        if let Err(err) =
+                            open_diff_buffer_for_path(cx.editor, entry.change.path(), action)
+                        {
+                            cx.editor.set_error(err.to_string());
+                        }
+                    },
+                )
+                .with_preview(|editor, entry| {
+                    write_diff_preview_file_at(editor, entry.change.path(), &entry.preview_path)
+                        .ok()?;
+                    Some((entry.preview_path.as_path().into(), None))
+                });
+
+                let injector = picker.injector();
+                editor
+                    .diff_providers
+                    .clone()
+                    .for_each_changed_file(cwd.clone(), move |change| match change {
+                        Ok(change) => injector
+                            .push(DiffPickerEntry {
+                                preview_path: diff_preview_temp_path(change.path()),
+                                change,
+                            })
+                            .is_ok(),
+                        Err(err) => {
+                            status::report_blocking(err);
+                            true
+                        }
+                    });
+                compositor.push(Box::new(overlaid(picker)));
+            }));
+        Ok(call)
+    };
+    cx.jobs.callback(callback);
+}
+
+fn write_diff_preview_file_at(
+    editor: &Editor,
+    path: &Path,
+    preview_path: &Path,
+) -> anyhow::Result<()> {
+    let stamp = diff_preview_stamp(editor, path)?;
+    if DIFF_PREVIEW_CACHE
+        .get(path)
+        .is_some_and(|entry| entry.stamp == stamp && preview_path.exists())
+    {
+        return Ok(());
+    }
+
+    let Some(diff_data) = diff_for_path(editor, path)? else {
+        let _ = fs::remove_file(preview_path);
+        DIFF_PREVIEW_CACHE.insert(path.to_path_buf(), DiffPreviewCacheEntry { stamp });
+        return Ok(());
+    };
+    fs::write(preview_path, diff_data.text)?;
+    DIFF_PREVIEW_CACHE.insert(path.to_path_buf(), DiffPreviewCacheEntry { stamp });
+    Ok(())
+}
+
+fn diff_preview_temp_path(path: &Path) -> PathBuf {
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    std::env::temp_dir().join(format!("helix-diff-preview-{:x}.diff", hasher.finish()))
+}
+
+fn diff_preview_stamp(editor: &Editor, path: &Path) -> anyhow::Result<DiffPreviewStamp> {
+    if let Some(doc) = editor.document_by_path(path) {
+        return Ok(DiffPreviewStamp::OpenDocument {
+            version: doc.version(),
+        });
+    }
+
+    match fs::metadata(path) {
+        Ok(metadata) => {
+            let modified = metadata
+                .modified()?
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            Ok(DiffPreviewStamp::FileOnDisk {
+                modified_ms: modified,
+                len: metadata.len(),
+            })
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(DiffPreviewStamp::Missing),
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -4460,64 +5079,79 @@ mod tests {
     use super::*;
 
     #[test]
-    fn format_diff_popup_renders_modified_lines() {
+    fn format_unified_diff_renders_modified_lines() {
         let base = Rope::from("one\ntwo\nthree\n");
         let doc = Rope::from("one\nTWO\nthree\n");
-
-        let rendered = format!(
-            "```diff\n{}```",
-            format_diff_text(
-                "test.txt",
-                &base,
-                &doc,
-                &[Hunk {
-                    before: 1..2,
-                    after: 1..2,
-                }],
-            )
+        let rendered = format_unified_diff_text(
+            "test.txt",
+            &base,
+            &doc,
+            &[Hunk {
+                before: 1..2,
+                after: 1..2,
+            }],
         );
 
         assert_eq!(
             rendered,
-            "```diff\n--- a/test.txt\n+++ b/test.txt\n@@ -2 +2 @@\n-two\n+TWO\n```"
+            "diff --git a/test.txt b/test.txt\n1 hunk, +1, -1\n--- a/test.txt\n+++ b/test.txt\n\n@@ -1,4 +1,4 @@\n one\n-two\n+TWO\n three\n \n\n"
         );
     }
 
     #[test]
-    fn format_diff_popup_renders_insertions() {
+    fn format_unified_diff_renders_insertions() {
         let base = Rope::from("one\nthree\n");
         let doc = Rope::from("one\ntwo\nthree\n");
-        let mut rendered = String::new();
-
-        format_diff_hunk(
-            &mut rendered,
+        let rendered = format_unified_diff_text(
+            "test.txt",
             &base,
             &doc,
-            Hunk {
+            &[Hunk {
                 before: 1..1,
                 after: 1..2,
-            },
+            }],
         );
 
-        assert_eq!(rendered, "@@ -1,0 +2 @@\n+two\n");
+        assert_eq!(
+            rendered,
+            "diff --git a/test.txt b/test.txt\n1 hunk, +1, -0\n--- a/test.txt\n+++ b/test.txt\n\n@@ -1,3 +1,4 @@\n one\n+two\n three\n \n\n"
+        );
     }
 
     #[test]
-    fn format_diff_popup_renders_deletions() {
+    fn format_unified_diff_renders_deletions() {
         let base = Rope::from("one\ntwo\nthree\n");
         let doc = Rope::from("one\nthree\n");
-        let mut rendered = String::new();
-
-        format_diff_hunk(
-            &mut rendered,
+        let rendered = format_unified_diff_text(
+            "test.txt",
             &base,
             &doc,
-            Hunk {
+            &[Hunk {
                 before: 1..2,
                 after: 1..1,
-            },
+            }],
         );
 
-        assert_eq!(rendered, "@@ -2 +1,0 @@\n-two\n");
+        assert_eq!(
+            rendered,
+            "diff --git a/test.txt b/test.txt\n1 hunk, +0, -1\n--- a/test.txt\n+++ b/test.txt\n\n@@ -1,4 +1,3 @@\n one\n-two\n three\n \n\n"
+        );
+    }
+
+    #[test]
+    fn format_unified_diff_marks_omitted_context() {
+        let base = Rope::from("1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n");
+        let doc = Rope::from("1\n2\nX\n4\n5\n6\n7\n8\n9\n10\n");
+        let rendered = format_unified_diff_text(
+            "test.txt",
+            &base,
+            &doc,
+            &[Hunk {
+                before: 2..3,
+                after: 2..3,
+            }],
+        );
+
+        assert!(rendered.contains("... 5 unchanged lines ..."));
     }
 }

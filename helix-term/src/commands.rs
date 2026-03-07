@@ -582,6 +582,10 @@ impl MappableCommand {
         goto_prev_entry, "Goto previous pairing",
         goto_next_paragraph, "Goto next paragraph",
         goto_prev_paragraph, "Goto previous paragraph",
+        diff_next_hunk, "Goto next hunk in generated diff buffer",
+        diff_prev_hunk, "Goto previous hunk in generated diff buffer",
+        diff_next_file, "Goto next changed file in generated diff buffer",
+        diff_prev_file, "Goto previous changed file in generated diff buffer",
         dap_launch, "Launch debug target",
         dap_restart, "Restart debugging session",
         dap_toggle_breakpoint, "Toggle breakpoint",
@@ -6087,6 +6091,22 @@ fn goto_next_parameter(cx: &mut Context) {
 
 fn goto_prev_parameter(cx: &mut Context) {
     goto_ts_object_impl(cx, "parameter", Direction::Backward)
+}
+
+fn diff_next_hunk(cx: &mut Context) {
+    typed::diff_buffer_navigate(cx.editor, typed::DiffNavigation::NextHunk);
+}
+
+fn diff_prev_hunk(cx: &mut Context) {
+    typed::diff_buffer_navigate(cx.editor, typed::DiffNavigation::PrevHunk);
+}
+
+fn diff_next_file(cx: &mut Context) {
+    typed::diff_buffer_navigate(cx.editor, typed::DiffNavigation::NextFile);
+}
+
+fn diff_prev_file(cx: &mut Context) {
+    typed::diff_buffer_navigate(cx.editor, typed::DiffNavigation::PrevFile);
 }
 
 fn goto_next_comment(cx: &mut Context) {

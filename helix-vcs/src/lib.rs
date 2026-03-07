@@ -100,6 +100,29 @@ impl DiffProviderRegistry {
             }
         });
     }
+
+    /// Synchronously collect changed files for the first provider that succeeds.
+    pub fn changed_files(&self, cwd: &Path) -> Result<Vec<FileChange>> {
+        let last_error = std::cell::RefCell::new(None);
+
+        for provider in &self.providers {
+            let files = std::cell::RefCell::new(Vec::new());
+            match provider.for_each_changed_file(cwd, |change| {
+                match change {
+                    Ok(change) => files.borrow_mut().push(change),
+                    Err(err) => *last_error.borrow_mut() = Some(err),
+                }
+                true
+            }) {
+                Ok(()) => return Ok(files.into_inner()),
+                Err(err) => *last_error.borrow_mut() = Some(err),
+            }
+        }
+
+        Err(last_error
+            .into_inner()
+            .unwrap_or_else(|| anyhow!("no diff provider returns success")))
+    }
 }
 
 impl Default for DiffProviderRegistry {

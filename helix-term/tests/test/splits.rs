@@ -1,6 +1,8 @@
 use super::*;
 
+use helix_core::{Selection, Transaction};
 use helix_stdx::path;
+use helix_view::{current, current_ref, doc, editor::Action};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_split_write_quit_all() -> anyhow::Result<()> {
@@ -210,6 +212,103 @@ async fn test_changes_in_splits_jumplist_sync() -> anyhow::Result<()> {
         "#[|]#",
         LineFeedHandling::AsIs,
     ))
+    .await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_q_closes_generated_diff_buffer_without_git_header() -> anyhow::Result<()> {
+    let file = tempfile::NamedTempFile::new()?;
+    let mut app = helpers::AppBuilder::new()
+        .with_file(file.path(), None)
+        .build()?;
+
+    app.editor.new_file(Action::VerticalSplit);
+    {
+        let loader = app.editor.syn_loader.load();
+        let (view, doc) = current!(app.editor);
+        let transaction = Transaction::change(
+            doc.text(),
+            std::iter::once((
+                0,
+                doc.text().len_chars(),
+                Some("--- a/test.txt\n+++ b/test.txt\n@@ -1 +1 @@\n-old\n+new\n".into()),
+            )),
+        )
+        .with_selection(Selection::point(0));
+        doc.apply(&transaction, view.id);
+        doc.append_changes_to_history(view);
+        doc.reset_modified();
+        doc.set_language_by_language_id("diff", &loader)?;
+        doc.readonly = true;
+    }
+
+    test_key_sequences(
+        &mut app,
+        vec![(
+            Some("q"),
+            Some(&|app| {
+                assert_eq!(1, app.editor.tree.views().count());
+                let (_view, doc) = current_ref!(app.editor);
+                assert_eq!(Some(file.path()), doc.path().map(|path| path.as_path()));
+            }),
+        )],
+        false,
+    )
+    .await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_q_closes_generated_diff_buffer_when_it_is_last_view() -> anyhow::Result<()> {
+    let file = tempfile::NamedTempFile::new()?;
+    let mut app = helpers::AppBuilder::new()
+        .with_file(file.path(), None)
+        .build()?;
+
+    let source_doc_id = doc!(app.editor).id();
+    app.editor.new_file(Action::VerticalSplit);
+    {
+        let loader = app.editor.syn_loader.load();
+        let (view, doc) = current!(app.editor);
+        let transaction = Transaction::change(
+            doc.text(),
+            std::iter::once((
+                0,
+                doc.text().len_chars(),
+                Some("--- a/test.txt\n+++ b/test.txt\n@@ -1 +1 @@\n-old\n+new\n".into()),
+            )),
+        )
+        .with_selection(Selection::point(0));
+        doc.apply(&transaction, view.id);
+        doc.append_changes_to_history(view);
+        doc.reset_modified();
+        doc.set_language_by_language_id("diff", &loader)?;
+        doc.readonly = true;
+    }
+    let source_view_id = app
+        .editor
+        .tree
+        .views()
+        .find(|(view, _)| view.doc == source_doc_id)
+        .map(|(view, _)| view.id)
+        .unwrap();
+    app.editor.close(source_view_id);
+
+    test_key_sequences(
+        &mut app,
+        vec![(
+            Some("q"),
+            Some(&|app| {
+                assert_eq!(1, app.editor.tree.views().count());
+                let (_view, doc) = current_ref!(app.editor);
+                assert_eq!(Some(file.path()), doc.path().map(|path| path.as_path()));
+            }),
+        )],
+        false,
+    )
     .await?;
 
     Ok(())
