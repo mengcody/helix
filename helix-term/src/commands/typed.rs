@@ -10,7 +10,7 @@ use helix_core::command_line::{Args, Flag, Signature, Token, TokenKind};
 use helix_core::fuzzy::fuzzy_match;
 use helix_core::indent::MAX_INDENT;
 use helix_core::line_ending;
-use helix_stdx::path::home_dir;
+use helix_stdx::path::{get_relative_path, home_dir};
 use helix_view::document::{read_to_string, DEFAULT_LANGUAGE_NAME};
 use helix_view::editor::{CloseError, ConfigEvent};
 use helix_view::expansion;
@@ -2509,6 +2509,122 @@ fn run_shell_command(
     Ok(())
 }
 
+fn show_diff(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let Some(diff) = current_buffer_diff_text(cx.editor)? else {
+        cx.editor.set_status("Current buffer has no changes");
+        return Ok(());
+    };
+
+    cx.editor.new_file(Action::VerticalSplit);
+    let loader = cx.editor.syn_loader.load();
+    let (view, doc) = current!(cx.editor);
+    let transaction = Transaction::insert(doc.text(), doc.selection(view.id), diff.into())
+        .with_selection(Selection::point(0));
+    doc.apply(&transaction, view.id);
+    doc.append_changes_to_history(view);
+    doc.reset_modified();
+    doc.set_language_by_language_id("diff", &loader)?;
+    doc.readonly = true;
+
+    cx.editor.set_status("Opened diff in split buffer");
+    Ok(())
+}
+
+pub(crate) fn diff_buffer_quit(editor: &mut Editor) -> bool {
+    let view_id = {
+        let (view, doc) = current_ref!(editor);
+        if !is_generated_diff_buffer(doc) {
+            return false;
+        }
+        view.id
+    };
+
+    editor.close(view_id);
+    editor.set_status("Closed diff buffer");
+    true
+}
+
+fn current_buffer_diff_text(editor: &Editor) -> anyhow::Result<Option<String>> {
+    let doc = doc!(editor);
+    let Some(handle) = doc.diff_handle() else {
+        bail!("Diff is not available in the current buffer")
+    };
+
+    let diff = handle.load();
+    if diff.is_empty() {
+        return Ok(None);
+    }
+
+    let path = doc
+        .path()
+        .map(|path| get_relative_path(path).display().to_string())
+        .unwrap_or_else(|| SCRATCH_BUFFER_NAME.to_string());
+    let hunks: Vec<_> = (0..diff.len()).map(|idx| diff.nth_hunk(idx)).collect();
+    Ok(Some(format_diff_text(
+        &path,
+        diff.diff_base(),
+        diff.doc(),
+        &hunks,
+    )))
+}
+
+fn format_diff_text(path: &str, diff_base: &Rope, doc: &Rope, hunks: &[Hunk]) -> String {
+    let mut contents = String::new();
+    let _ = writeln!(contents, "--- a/{path}");
+    let _ = writeln!(contents, "+++ b/{path}");
+
+    for hunk in hunks {
+        format_diff_hunk(&mut contents, diff_base, doc, hunk.clone());
+    }
+
+    contents
+}
+
+fn is_generated_diff_buffer(doc: &Document) -> bool {
+    doc.path().is_none() && doc.language_name() == Some("diff")
+}
+
+fn format_diff_hunk(output: &mut String, diff_base: &Rope, doc: &Rope, hunk: Hunk) {
+    let _ = writeln!(
+        output,
+        "@@ -{} +{} @@",
+        format_unified_range(&hunk.before),
+        format_unified_range(&hunk.after)
+    );
+    push_prefixed_lines(output, '-', diff_base, hunk.before.start, hunk.before.end);
+    push_prefixed_lines(output, '+', doc, hunk.after.start, hunk.after.end);
+}
+
+fn format_unified_range(range: &std::ops::Range<u32>) -> String {
+    let start = if range.is_empty() {
+        range.start
+    } else {
+        range.start + 1
+    };
+    let len = range.end - range.start;
+
+    if len == 1 {
+        start.to_string()
+    } else {
+        format!("{start},{len}")
+    }
+}
+
+fn push_prefixed_lines(output: &mut String, prefix: char, text: &Rope, start: u32, end: u32) {
+    for line_idx in start as usize..end as usize {
+        let line = text.line(line_idx).to_string();
+        output.push(prefix);
+        output.push_str(&line);
+        if !line.ends_with('\n') {
+            output.push('\n');
+        }
+    }
+}
+
 fn reset_diff_change(
     cx: &mut compositor::Context,
     _args: Args,
@@ -3760,6 +3876,17 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         signature: SHELL_SIGNATURE,
     },
     TypableCommand {
+        name: "show-diff",
+        aliases: &["diff"],
+        doc: "Open the current buffer's unified diff in a vertical split buffer.",
+        fun: show_diff,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
         name: "reset-diff-change",
         aliases: &["diffget", "diffg"],
         doc: "Reset the diff change at the cursor position.",
@@ -4279,4 +4406,71 @@ fn complete_expansion_kind(content: &str, offset: usize) -> Vec<ui::prompt::Comp
     .into_iter()
     .map(|(name, _)| (offset.., (*name).into()))
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_diff_popup_renders_modified_lines() {
+        let base = Rope::from("one\ntwo\nthree\n");
+        let doc = Rope::from("one\nTWO\nthree\n");
+
+        let rendered = format!(
+            "```diff\n{}```",
+            format_diff_text(
+                "test.txt",
+                &base,
+                &doc,
+                &[Hunk {
+                    before: 1..2,
+                    after: 1..2,
+                }],
+            )
+        );
+
+        assert_eq!(
+            rendered,
+            "```diff\n--- a/test.txt\n+++ b/test.txt\n@@ -2 +2 @@\n-two\n+TWO\n```"
+        );
+    }
+
+    #[test]
+    fn format_diff_popup_renders_insertions() {
+        let base = Rope::from("one\nthree\n");
+        let doc = Rope::from("one\ntwo\nthree\n");
+        let mut rendered = String::new();
+
+        format_diff_hunk(
+            &mut rendered,
+            &base,
+            &doc,
+            Hunk {
+                before: 1..1,
+                after: 1..2,
+            },
+        );
+
+        assert_eq!(rendered, "@@ -1,0 +2 @@\n+two\n");
+    }
+
+    #[test]
+    fn format_diff_popup_renders_deletions() {
+        let base = Rope::from("one\ntwo\nthree\n");
+        let doc = Rope::from("one\nthree\n");
+        let mut rendered = String::new();
+
+        format_diff_hunk(
+            &mut rendered,
+            &base,
+            &doc,
+            Hunk {
+                before: 1..2,
+                after: 1..1,
+            },
+        );
+
+        assert_eq!(rendered, "@@ -2 +1,0 @@\n-two\n");
+    }
 }

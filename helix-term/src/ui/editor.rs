@@ -1028,6 +1028,18 @@ impl EditorView {
 
     fn command_mode(&mut self, mode: Mode, cxt: &mut commands::Context, event: KeyEvent) {
         match (event, cxt.editor.count) {
+            (key!('q'), None) if self.keymaps.pending().is_empty() => {
+                if !commands::typed::diff_buffer_quit(cxt.editor) {
+                    let res = self.handle_keymap_event(mode, cxt, event);
+                    if matches!(&res, Some(KeymapResult::NotFound)) {
+                        self.on_next_key(OnKeyCallbackKind::Fallback, cxt, event);
+                    }
+                    if self.keymaps.pending().is_empty() {
+                        cxt.editor.count = None;
+                        cxt.editor.selected_register = None;
+                    }
+                }
+            }
             // If the count is already started and the input is a number, always continue the count.
             (key!(i @ '0'..='9'), Some(count)) => {
                 let i = i.to_digit(10).unwrap() as usize;
