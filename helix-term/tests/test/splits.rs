@@ -315,7 +315,7 @@ async fn test_q_closes_generated_diff_buffer_when_it_is_last_view() -> anyhow::R
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_show_diff_command_opens_current_file_diff_buffer() -> anyhow::Result<()> {
+async fn test_show_diff_command_opens_and_closes_diff_viewer() -> anyhow::Result<()> {
     let repo = helpers::GitRepoFixture::new_with_file("file.txt", "one\ntwo\n")?;
     let _cwd = helpers::WorkingDirGuard::set(&repo.root)?;
     let mut app = helpers::AppBuilder::new()
@@ -328,26 +328,23 @@ async fn test_show_diff_command_opens_current_file_diff_buffer() -> anyhow::Resu
             (
                 Some("inew <esc>:show-diff<ret>"),
                 Some(&|app| {
-                    assert_eq!(2, app.editor.tree.views().count());
+                    assert_eq!(1, app.editor.tree.views().count());
 
-                    let (view, doc) = current_ref!(app.editor);
-                    assert!(doc.path().is_none());
-                    assert_eq!(Some("diff"), doc.language_name());
-                    assert!(doc.readonly);
-
-                    let text = doc.text().to_string();
-                    assert!(text.contains("diff --git a/file.txt b/file.txt"));
-                    assert!(text.contains("@@ "));
-
-                    let line = doc
-                        .text()
-                        .line(
-                            doc.selection(view.id)
-                                .primary()
-                                .cursor_line(doc.text().slice(..)),
-                        )
-                        .to_string();
-                    assert!(line.starts_with("@@ "));
+                    let (_view, doc) = current_ref!(app.editor);
+                    assert_eq!(
+                        Some(repo.file.as_path()),
+                        doc.path().map(|path| path.as_path())
+                    );
+                    assert_ne!(Some("diff"), doc.language_name());
+                }),
+            ),
+            (
+                Some("qi!<esc>"),
+                Some(&|app| {
+                    assert_eq!(1, app.editor.tree.views().count());
+                    let (_view, doc) = current_ref!(app.editor);
+                    assert!(doc.text().to_string().contains('!'));
+                    assert!(doc.is_modified());
                 }),
             ),
             (Some(":qa!<ret>"), None),
@@ -390,7 +387,7 @@ async fn test_space_h_keeps_diff_picker_behavior() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_show_diff_command_rejects_generated_diff_buffer() -> anyhow::Result<()> {
+async fn test_show_diff_command_can_reopen_after_close() -> anyhow::Result<()> {
     let repo = helpers::GitRepoFixture::new_with_file("file.txt", "one\ntwo\n")?;
     let _cwd = helpers::WorkingDirGuard::set(&repo.root)?;
     let mut app = helpers::AppBuilder::new()
@@ -400,20 +397,115 @@ async fn test_show_diff_command_rejects_generated_diff_buffer() -> anyhow::Resul
     test_key_sequences(
         &mut app,
         vec![
-            (Some("inew <esc>:show-diff<ret>"), None),
             (
                 Some(":show-diff<ret>"),
                 Some(&|app| {
-                    assert_eq!(2, app.editor.tree.views().count());
+                    assert_eq!(1, app.editor.tree.views().count());
+                    helpers::assert_status_not_error(&app.editor);
+                }),
+            ),
+            (Some("q"), None),
+            (
+                Some(":show-diff<ret>"),
+                Some(&|app| {
+                    assert_eq!(1, app.editor.tree.views().count());
+                    helpers::assert_status_not_error(&app.editor);
+                }),
+            ),
+            (Some(":qa!<ret>"), None),
+        ],
+        true,
+    )
+    .await?;
 
-                    let (_view, doc) = current_ref!(app.editor);
-                    assert_eq!(Some("diff"), doc.language_name());
+    Ok(())
+}
 
-                    let (message, severity) = app.editor.get_status().expect("error status");
-                    assert_eq!(*severity, helix_core::diagnostic::Severity::Error);
-                    assert!(message
-                        .as_ref()
-                        .contains("Current buffer is already a generated diff buffer"));
+#[tokio::test(flavor = "multi_thread")]
+async fn test_show_diff_command_requires_file_backing() -> anyhow::Result<()> {
+    let mut app = helpers::AppBuilder::new().build()?;
+
+    test_key_sequences(
+        &mut app,
+        vec![(
+            Some(":show-diff<ret>"),
+            Some(&|app| {
+                let (message, severity) = app.editor.get_status().expect("error status");
+                assert_eq!(*severity, helix_core::diagnostic::Severity::Error);
+                assert!(message
+                    .as_ref()
+                    .contains("Current buffer is not associated with a file"));
+                assert_eq!(1, app.editor.tree.views().count());
+            }),
+        )],
+        false,
+    )
+    .await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_diff_viewer_hunk_navigation_updates_status() -> anyhow::Result<()> {
+    let repo = helpers::GitRepoFixture::new_with_file(
+        "file.txt",
+        "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n",
+    )?;
+    let _cwd = helpers::WorkingDirGuard::set(&repo.root)?;
+    repo.write_file(
+        "file.txt",
+        "one\nchanged two\nthree\nfour\nfive\nsix\nseven\nchanged eight\nnine\nten\n",
+    )?;
+
+    let mut app = helpers::AppBuilder::new()
+        .with_file(&repo.file, None)
+        .build()?;
+
+    test_key_sequences(
+        &mut app,
+        vec![
+            (Some("gg:show-diff<ret>"), None),
+            (
+                Some("]h"),
+                Some(&|app| {
+                    let (message, severity) = app.editor.get_status().expect("status");
+                    assert_eq!(*severity, helix_core::diagnostic::Severity::Info);
+                    assert!(message.as_ref().starts_with("Hunk "));
+                    assert!(message.as_ref().contains("file.txt"));
+                }),
+            ),
+            (Some(":qa!<ret>"), None),
+        ],
+        true,
+    )
+    .await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_diff_viewer_file_navigation_updates_status() -> anyhow::Result<()> {
+    let repo = helpers::GitRepoFixture::new_with_file("file.txt", "one\ntwo\n")?;
+    let _cwd = helpers::WorkingDirGuard::set(&repo.root)?;
+    repo.write_file("other.txt", "alpha\nbeta\n")?;
+    repo.commit_all("add second file");
+    repo.write_file("file.txt", "one\nchanged two\n")?;
+    repo.write_file("other.txt", "alpha\nchanged beta\n")?;
+
+    let mut app = helpers::AppBuilder::new()
+        .with_file(&repo.file, None)
+        .build()?;
+
+    test_key_sequences(
+        &mut app,
+        vec![
+            (Some(":show-diff<ret>"), None),
+            (
+                Some("]H"),
+                Some(&|app| {
+                    let (message, severity) = app.editor.get_status().expect("status");
+                    assert_eq!(*severity, helix_core::diagnostic::Severity::Info);
+                    assert!(message.as_ref().contains("Diff 2/2: other.txt"));
                 }),
             ),
             (Some(":qa!<ret>"), None),

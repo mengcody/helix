@@ -81,6 +81,20 @@ impl GitRepoFixture {
             _repo: repo,
         })
     }
+
+    pub fn write_file(&self, path: impl AsRef<Path>, contents: &str) -> anyhow::Result<PathBuf> {
+        let file = self.root.join(path.as_ref());
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        File::create(&file)?.write_all(contents.as_bytes())?;
+        Ok(file)
+    }
+
+    pub fn commit_all(&self, message: &str) {
+        exec_git(&["add", "-A"], &self.root);
+        exec_git(&["commit", "-m", message], &self.root);
+    }
 }
 
 fn exec_git(args: &[&str], repo: &Path) {

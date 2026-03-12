@@ -6105,19 +6105,35 @@ fn goto_prev_parameter(cx: &mut Context) {
 }
 
 fn diff_next_hunk(cx: &mut Context) {
-    typed::diff_buffer_navigate(cx.editor, typed::DiffNavigation::NextHunk);
+    cx.callback.push(Box::new(|compositor, cx| {
+        if !typed::diff_viewer_navigate(cx.editor, compositor, typed::DiffNavigation::NextHunk) {
+            typed::diff_buffer_navigate(cx.editor, typed::DiffNavigation::NextHunk);
+        }
+    }));
 }
 
 fn diff_prev_hunk(cx: &mut Context) {
-    typed::diff_buffer_navigate(cx.editor, typed::DiffNavigation::PrevHunk);
+    cx.callback.push(Box::new(|compositor, cx| {
+        if !typed::diff_viewer_navigate(cx.editor, compositor, typed::DiffNavigation::PrevHunk) {
+            typed::diff_buffer_navigate(cx.editor, typed::DiffNavigation::PrevHunk);
+        }
+    }));
 }
 
 fn diff_next_file(cx: &mut Context) {
-    typed::diff_buffer_navigate(cx.editor, typed::DiffNavigation::NextFile);
+    cx.callback.push(Box::new(|compositor, cx| {
+        if !typed::diff_viewer_navigate(cx.editor, compositor, typed::DiffNavigation::NextFile) {
+            typed::diff_buffer_navigate(cx.editor, typed::DiffNavigation::NextFile);
+        }
+    }));
 }
 
 fn diff_prev_file(cx: &mut Context) {
-    typed::diff_buffer_navigate(cx.editor, typed::DiffNavigation::PrevFile);
+    cx.callback.push(Box::new(|compositor, cx| {
+        if !typed::diff_viewer_navigate(cx.editor, compositor, typed::DiffNavigation::PrevFile) {
+            typed::diff_buffer_navigate(cx.editor, typed::DiffNavigation::PrevFile);
+        }
+    }));
 }
 
 fn goto_next_comment(cx: &mut Context) {
