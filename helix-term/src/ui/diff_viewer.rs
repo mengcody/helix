@@ -6,6 +6,7 @@ use helix_view::{
     graphics::{Margin, Modifier, Rect},
     theme::Style,
 };
+use imara_diff::{Algorithm, Diff, Hunk, InternedInput};
 use tui::{
     buffer::Buffer as Surface,
     widgets::{Block, Widget},
@@ -171,6 +172,8 @@ impl DiffViewer {
 
         let header_style = cx.editor.theme.get("ui.text.info");
         let separator_style = cx.editor.theme.get("ui.window");
+        let line_no_width = self.line_number_width();
+        let sign_width = 2usize;
         let separator_x = area.x + area.width / 2;
         let left_width = separator_x.saturating_sub(area.x);
         let right_x = separator_x.saturating_add(1);
@@ -180,11 +183,47 @@ impl DiffViewer {
         surface.set_style(Rect::new(separator_x, area.y, 1, 1), separator_style);
         surface.set_string(separator_x, area.y, "│", separator_style);
         if left_width > 0 {
-            surface.set_stringn(area.x, area.y, " OLD", left_width as usize, header_style);
+            let label = format!(
+                "{:>line_no_width$} {:<sign_width$} OLD",
+                "",
+                "",
+                line_no_width = line_no_width,
+                sign_width = sign_width
+            );
+            surface.set_stringn(area.x, area.y, label, left_width as usize, header_style);
         }
         if right_width > 0 {
-            surface.set_stringn(right_x, area.y, " NEW", right_width as usize, header_style);
+            let label = format!(
+                "{:>line_no_width$} {:<sign_width$} NEW",
+                "",
+                "",
+                line_no_width = line_no_width,
+                sign_width = sign_width
+            );
+            surface.set_stringn(right_x, area.y, label, right_width as usize, header_style);
         }
+    }
+
+    fn line_number_width(&self) -> usize {
+        let max_line = self
+            .data
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                DiffRow::Context {
+                    left_no, right_no, ..
+                } => left_no.or(*right_no),
+                DiffRow::Delete { left_no, .. } => Some(*left_no),
+                DiffRow::Insert { right_no, .. } => Some(*right_no),
+                DiffRow::Modify {
+                    left_no, right_no, ..
+                } => Some((*left_no).max(*right_no)),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+
+        max_line.to_string().len().max(2)
     }
 
     fn render_split_row(
@@ -195,6 +234,8 @@ impl DiffViewer {
         right_no: Option<u32>,
         left: &str,
         right: &str,
+        left_marker: char,
+        right_marker: char,
         left_style: Style,
         right_style: Style,
         gutter_style: Style,
@@ -219,9 +260,16 @@ impl DiffViewer {
         surface.set_style(Rect::new(separator_x, area.y, 1, 1), separator_style);
         surface.set_string(separator_x, area.y, "│", separator_style);
 
-        let line_no_width = 5usize;
-        let left_label = left_no.map_or_else(|| " ".repeat(line_no_width), |n| format!("{n:>5}"));
-        let right_label = right_no.map_or_else(|| " ".repeat(line_no_width), |n| format!("{n:>5}"));
+        let line_no_width = self.line_number_width();
+        let sign_width = 2usize;
+        let left_label = left_no.map_or_else(
+            || " ".repeat(line_no_width),
+            |n| format!("{n:>width$}", width = line_no_width),
+        );
+        let right_label = right_no.map_or_else(
+            || " ".repeat(line_no_width),
+            |n| format!("{n:>width$}", width = line_no_width),
+        );
 
         surface.set_stringn(
             area.x,
@@ -230,12 +278,21 @@ impl DiffViewer {
             left_width as usize,
             gutter_style,
         );
-        if left_width as usize > line_no_width + 1 {
+        if left_width as usize > line_no_width {
+            surface.set_stringn(
+                area.x + line_no_width as u16,
+                area.y,
+                format!(" {:<sign_width$}", left_marker, sign_width = sign_width),
+                left_width as usize - line_no_width,
+                left_style,
+            );
+        }
+        if left_width as usize > line_no_width + sign_width + 1 {
             self.render_content(
                 surface,
-                area.x + line_no_width as u16 + 1,
+                area.x + line_no_width as u16 + sign_width as u16 + 1,
                 area.y,
-                left_width as usize - line_no_width - 1,
+                left_width as usize - line_no_width - sign_width - 1,
                 left,
                 left_style,
                 inline_highlight.map(|(left, right)| (left, right, true)),
@@ -250,12 +307,21 @@ impl DiffViewer {
                 right_width as usize,
                 gutter_style,
             );
-            if right_width as usize > line_no_width + 1 {
+            if right_width as usize > line_no_width {
+                surface.set_stringn(
+                    right_x + line_no_width as u16,
+                    area.y,
+                    format!(" {:<sign_width$}", right_marker, sign_width = sign_width),
+                    right_width as usize - line_no_width,
+                    right_style,
+                );
+            }
+            if right_width as usize > line_no_width + sign_width + 1 {
                 self.render_content(
                     surface,
-                    right_x + line_no_width as u16 + 1,
+                    right_x + line_no_width as u16 + sign_width as u16 + 1,
                     area.y,
-                    right_width as usize - line_no_width - 1,
+                    right_width as usize - line_no_width - sign_width - 1,
                     right,
                     right_style,
                     inline_highlight.map(|(left, right)| (left, right, false)),
@@ -280,76 +346,223 @@ impl DiffViewer {
         };
 
         let segments = inline_diff_segments(left, right);
-        let (prefix, changed, suffix) = if is_left {
-            (segments.prefix, segments.left_changed, segments.suffix)
+        let segments = if is_left {
+            segments.left
         } else {
-            (segments.prefix, segments.right_changed, segments.suffix)
+            segments.right
         };
-
         let highlight_style = base_style.add_modifier(Modifier::BOLD);
-        let mut col = x;
-        let mut remaining = width;
 
-        for (segment, style) in [
-            (prefix.as_str(), base_style),
-            (changed.as_str(), highlight_style),
-            (suffix.as_str(), base_style),
-        ] {
-            if remaining == 0 || segment.is_empty() {
-                continue;
+        let mut styled_chars = Vec::new();
+        let mut first_highlight_col = None;
+        for segment in segments {
+            if segment.highlighted && first_highlight_col.is_none() {
+                first_highlight_col = Some(styled_chars.len());
             }
-            let rendered_width = surface
-                .set_stringn(
-                    col,
-                    y,
-                    truncate_with_ellipsis(segment, remaining),
-                    remaining,
-                    style,
-                )
-                .0;
-            let consumed = rendered_width.saturating_sub(col) as usize;
-            col = rendered_width;
-            remaining = remaining.saturating_sub(consumed);
+
+            for ch in segment.text.chars() {
+                styled_chars.push((ch, segment.highlighted));
+            }
+        }
+
+        let window = visible_inline_window(styled_chars.len(), width, first_highlight_col);
+        let mut col = x;
+
+        if window.show_leading_ellipsis {
+            surface.set_string(col, y, "…", base_style);
+            col = col.saturating_add(1);
+        }
+
+        for &(ch, highlighted) in &styled_chars[window.start..window.end] {
+            if col >= x + width as u16 {
+                break;
+            }
+            let style = if highlighted {
+                highlight_style
+            } else {
+                base_style
+            };
+            surface.set_string(col, y, ch.to_string(), style);
+            col = col.saturating_add(1);
+        }
+
+        if window.show_trailing_ellipsis && col < x + width as u16 {
+            surface.set_string(col, y, "…", base_style);
         }
     }
 }
 
 struct InlineDiffSegments {
-    prefix: String,
-    left_changed: String,
-    right_changed: String,
-    suffix: String,
+    left: Vec<InlineDiffSegment>,
+    right: Vec<InlineDiffSegment>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InlineDiffSegment {
+    text: String,
+    highlighted: bool,
+}
+
+fn push_inline_segment(
+    segments: &mut Vec<InlineDiffSegment>,
+    text: impl Iterator<Item = char>,
+    highlighted: bool,
+) {
+    let text: String = text.collect();
+    if text.is_empty() {
+        return;
+    }
+
+    if let Some(last) = segments.last_mut() {
+        if last.highlighted == highlighted {
+            last.text.push_str(&text);
+            return;
+        }
+    }
+
+    segments.push(InlineDiffSegment { text, highlighted });
 }
 
 fn inline_diff_segments(left: &str, right: &str) -> InlineDiffSegments {
-    let left_chars: Vec<char> = left.chars().collect();
-    let right_chars: Vec<char> = right.chars().collect();
+    let mut input = InternedInput::default();
+    input.update_before(left.chars());
+    input.update_after(right.chars());
 
-    let mut prefix_len = 0;
-    while prefix_len < left_chars.len()
-        && prefix_len < right_chars.len()
-        && left_chars[prefix_len] == right_chars[prefix_len]
-    {
-        prefix_len += 1;
+    let mut diff = Diff::default();
+    diff.compute_with(
+        Algorithm::Myers,
+        &input.before,
+        &input.after,
+        input.interner.num_tokens(),
+    );
+
+    let mut left_segments = Vec::new();
+    let mut right_segments = Vec::new();
+    let mut before_pos = 0usize;
+    let mut after_pos = 0usize;
+
+    for Hunk { before, after } in diff.hunks() {
+        push_inline_segment(
+            &mut left_segments,
+            input.before[before_pos..before.start as usize]
+                .iter()
+                .map(|&token| input.interner[token]),
+            false,
+        );
+        push_inline_segment(
+            &mut right_segments,
+            input.after[after_pos..after.start as usize]
+                .iter()
+                .map(|&token| input.interner[token]),
+            false,
+        );
+        push_inline_segment(
+            &mut left_segments,
+            input.before[before.start as usize..before.end as usize]
+                .iter()
+                .map(|&token| input.interner[token]),
+            true,
+        );
+        push_inline_segment(
+            &mut right_segments,
+            input.after[after.start as usize..after.end as usize]
+                .iter()
+                .map(|&token| input.interner[token]),
+            true,
+        );
+        before_pos = before.end as usize;
+        after_pos = after.end as usize;
     }
 
-    let mut suffix_len = 0;
-    while suffix_len < left_chars.len().saturating_sub(prefix_len)
-        && suffix_len < right_chars.len().saturating_sub(prefix_len)
-        && left_chars[left_chars.len() - 1 - suffix_len]
-            == right_chars[right_chars.len() - 1 - suffix_len]
-    {
-        suffix_len += 1;
-    }
-
-    let left_mid_end = left_chars.len().saturating_sub(suffix_len);
-    let right_mid_end = right_chars.len().saturating_sub(suffix_len);
+    push_inline_segment(
+        &mut left_segments,
+        input.before[before_pos..]
+            .iter()
+            .map(|&token| input.interner[token]),
+        false,
+    );
+    push_inline_segment(
+        &mut right_segments,
+        input.after[after_pos..]
+            .iter()
+            .map(|&token| input.interner[token]),
+        false,
+    );
 
     InlineDiffSegments {
-        prefix: left_chars[..prefix_len].iter().collect(),
-        left_changed: left_chars[prefix_len..left_mid_end].iter().collect(),
-        right_changed: right_chars[prefix_len..right_mid_end].iter().collect(),
-        suffix: left_chars[left_mid_end..].iter().collect(),
+        left: left_segments,
+        right: right_segments,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VisibleInlineWindow {
+    start: usize,
+    end: usize,
+    show_leading_ellipsis: bool,
+    show_trailing_ellipsis: bool,
+}
+
+fn visible_inline_window(
+    total_len: usize,
+    width: usize,
+    focus: Option<usize>,
+) -> VisibleInlineWindow {
+    if width == 0 || total_len == 0 {
+        return VisibleInlineWindow {
+            start: 0,
+            end: 0,
+            show_leading_ellipsis: false,
+            show_trailing_ellipsis: false,
+        };
+    }
+
+    if total_len <= width {
+        return VisibleInlineWindow {
+            start: 0,
+            end: total_len,
+            show_leading_ellipsis: false,
+            show_trailing_ellipsis: false,
+        };
+    }
+
+    if width == 1 {
+        return VisibleInlineWindow {
+            start: 0,
+            end: 0,
+            show_leading_ellipsis: false,
+            show_trailing_ellipsis: true,
+        };
+    }
+
+    let mut start = focus.unwrap_or(0).saturating_sub(width / 3);
+    let max_start = total_len.saturating_sub(width.saturating_sub(1));
+    start = start.min(max_start);
+
+    let mut show_leading_ellipsis = start > 0;
+    let mut available = width.saturating_sub(show_leading_ellipsis as usize);
+    let mut end = (start + available).min(total_len);
+    let mut show_trailing_ellipsis = end < total_len;
+
+    if show_trailing_ellipsis {
+        available = available.saturating_sub(1);
+        end = (start + available).min(total_len);
+        show_trailing_ellipsis = end < total_len;
+    }
+
+    if !show_trailing_ellipsis {
+        show_leading_ellipsis = start > 0;
+        available = width
+            .saturating_sub(show_leading_ellipsis as usize)
+            .saturating_sub(show_trailing_ellipsis as usize);
+        start = end.saturating_sub(available);
+    }
+
+    VisibleInlineWindow {
+        start,
+        end,
+        show_leading_ellipsis,
+        show_trailing_ellipsis,
     }
 }
 
@@ -480,15 +693,41 @@ impl Component for DiffViewer {
                     } else {
                         header_style
                     };
-                    let text = format!(" {path}   +{added}  -{removed}   side-by-side");
                     surface.set_style(line_area, block_style);
+                    let added_text = format!("+{added}");
+                    let removed_text = format!("-{removed}");
+                    let stats_width =
+                        (added_text.chars().count() + removed_text.chars().count() + 2) as u16;
+                    let path_width = line_area
+                        .width
+                        .saturating_sub(stats_width.saturating_add(3));
                     surface.set_stringn(
                         line_area.x,
                         line_area.y,
-                        text,
-                        line_area.width as usize,
+                        format!(" {path}"),
+                        path_width as usize,
                         style,
                     );
+                    if line_area.width > stats_width + 1 {
+                        let removed_width = removed_text.chars().count() as u16;
+                        let added_width = added_text.chars().count() as u16;
+                        let removed_x = line_area.right().saturating_sub(removed_width);
+                        let added_x = removed_x.saturating_sub(2 + added_width);
+                        surface.set_stringn(
+                            added_x,
+                            line_area.y,
+                            added_text,
+                            added_width as usize,
+                            plus_style,
+                        );
+                        surface.set_stringn(
+                            removed_x,
+                            line_area.y,
+                            removed_text,
+                            removed_width as usize,
+                            minus_style,
+                        );
+                    }
                 }
                 DiffRow::HunkHeader { text } => {
                     let style = if in_current_hunk {
@@ -500,7 +739,7 @@ impl Component for DiffViewer {
                     surface.set_stringn(
                         line_area.x,
                         line_area.y,
-                        format!(" {text}"),
+                        format!("┆ {text}"),
                         line_area.width as usize,
                         style,
                     );
@@ -517,6 +756,8 @@ impl Component for DiffViewer {
                     *right_no,
                     left,
                     right,
+                    ' ',
+                    ' ',
                     if in_current_hunk {
                         current_context_style
                     } else {
@@ -546,6 +787,8 @@ impl Component for DiffViewer {
                     None,
                     left,
                     "",
+                    '-',
+                    ' ',
                     if in_current_hunk {
                         current_minus_style
                     } else {
@@ -575,6 +818,8 @@ impl Component for DiffViewer {
                     Some(*right_no),
                     "",
                     right,
+                    ' ',
+                    '+',
                     if in_current_hunk {
                         current_context_style
                     } else {
@@ -609,6 +854,8 @@ impl Component for DiffViewer {
                     Some(*right_no),
                     left,
                     right,
+                    '-',
+                    '+',
                     if in_current_hunk {
                         current_minus_style
                     } else {
@@ -638,7 +885,7 @@ impl Component for DiffViewer {
                         subtle_style
                     };
                     surface.set_style(line_area, block_style);
-                    let fill = "─ ─ ─ ─ ─ ─ ─ ─ ─ ─";
+                    let fill = "┄┄┄";
                     surface.set_stringn(
                         line_area.x,
                         line_area.y,
@@ -657,5 +904,88 @@ impl Component for DiffViewer {
 
     fn id(&self) -> Option<&'static str> {
         Some(Self::ID)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inline_diff_segments_split_multiple_changed_regions() {
+        let segments = inline_diff_segments("alpha beta gamma", "alpha zeta gammx");
+
+        assert_eq!(
+            segments.left,
+            vec![
+                InlineDiffSegment {
+                    text: "alpha ".into(),
+                    highlighted: false,
+                },
+                InlineDiffSegment {
+                    text: "b".into(),
+                    highlighted: true,
+                },
+                InlineDiffSegment {
+                    text: "eta gamm".into(),
+                    highlighted: false,
+                },
+                InlineDiffSegment {
+                    text: "a".into(),
+                    highlighted: true,
+                },
+            ]
+        );
+        assert_eq!(
+            segments.right,
+            vec![
+                InlineDiffSegment {
+                    text: "alpha ".into(),
+                    highlighted: false,
+                },
+                InlineDiffSegment {
+                    text: "z".into(),
+                    highlighted: true,
+                },
+                InlineDiffSegment {
+                    text: "eta gamm".into(),
+                    highlighted: false,
+                },
+                InlineDiffSegment {
+                    text: "x".into(),
+                    highlighted: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn visible_inline_window_keeps_focus_in_view() {
+        let window = visible_inline_window(32, 10, Some(20));
+
+        assert_eq!(
+            window,
+            VisibleInlineWindow {
+                start: 17,
+                end: 25,
+                show_leading_ellipsis: true,
+                show_trailing_ellipsis: true,
+            }
+        );
+    }
+
+    #[test]
+    fn visible_inline_window_uses_full_width_without_focus() {
+        let window = visible_inline_window(12, 8, None);
+
+        assert_eq!(
+            window,
+            VisibleInlineWindow {
+                start: 0,
+                end: 7,
+                show_leading_ellipsis: false,
+                show_trailing_ellipsis: true,
+            }
+        );
     }
 }
