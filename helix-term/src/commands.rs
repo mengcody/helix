@@ -419,7 +419,7 @@ impl MappableCommand {
         lsp_or_syntax_workspace_symbol_picker, "Open workspace symbol picker from LSP or syntax information",
         diagnostics_picker, "Open diagnostic picker",
         workspace_diagnostics_picker, "Open workspace diagnostic picker",
-        show_diff, "Open the current buffer's unified diff in a vertical split buffer",
+        show_diff, "Open the changed-file diff picker",
         last_picker, "Open last picker",
         insert_at_line_start, "Insert at start of line",
         insert_at_line_end, "Insert at end of line",
@@ -3641,20 +3641,13 @@ pub fn command_palette(cx: &mut Context) {
 }
 
 fn show_diff(cx: &mut Context) {
-    let Some(command) = typed::TYPABLE_COMMAND_MAP.get("show-diff") else {
-        cx.editor.set_error("no such command: 'show-diff'");
-        return;
-    };
-
     let mut cx = compositor::Context {
         editor: cx.editor,
         jobs: cx.jobs,
         scroll: None,
     };
 
-    if let Err(err) = typed::execute_command(&mut cx, command, "", PromptEvent::Validate) {
-        cx.editor.set_error(err.to_string());
-    }
+    typed::open_diff_picker(&mut cx);
 }
 
 fn last_picker(cx: &mut Context) {

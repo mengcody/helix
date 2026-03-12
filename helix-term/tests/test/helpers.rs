@@ -1,14 +1,19 @@
 use std::{
+    fs::File,
     io::{Read, Write},
     mem::replace,
-    path::PathBuf,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::{Mutex, MutexGuard},
     time::Duration,
 };
 
 use anyhow::bail;
 use helix_core::{diagnostic::Severity, test, Selection, Transaction};
+use helix_stdx::env;
 use helix_term::{application::Application, args::Args, config::Config, keymap::merge_keys};
 use helix_view::{current_ref, doc, editor::LspConfig, input::parse_macro, Editor};
+use once_cell::sync::Lazy;
 use tempfile::NamedTempFile;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
@@ -16,6 +21,97 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use crossterm::event::{Event, KeyEvent};
 #[cfg(not(windows))]
 use termina::event::{Event, KeyEvent};
+
+static CWD_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+pub struct WorkingDirGuard {
+    previous: PathBuf,
+    _guard: MutexGuard<'static, ()>,
+}
+
+impl WorkingDirGuard {
+    pub fn set(path: &Path) -> anyhow::Result<Self> {
+        let guard = CWD_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = env::current_working_dir();
+        env::set_current_working_dir(path)?;
+        Ok(Self {
+            previous,
+            _guard: guard,
+        })
+    }
+}
+
+impl Drop for WorkingDirGuard {
+    fn drop(&mut self) {
+        env::set_current_working_dir(&self.previous).expect("restore working directory after test");
+    }
+}
+
+pub struct GitRepoFixture {
+    _repo: tempfile::TempDir,
+    pub root: PathBuf,
+    pub file: PathBuf,
+}
+
+impl GitRepoFixture {
+    pub fn new_with_file(path: impl AsRef<Path>, contents: &str) -> anyhow::Result<Self> {
+        let repo = tempfile::tempdir()?;
+        exec_git(&["init"], repo.path());
+        exec_git(&["config", "user.email", "test@helix.org"], repo.path());
+        exec_git(&["config", "user.name", "helix-test"], repo.path());
+
+        let file = repo.path().join(path.as_ref());
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        File::create(&file)?.write_all(contents.as_bytes())?;
+
+        let repo_relative_path = file
+            .strip_prefix(repo.path())
+            .expect("git fixture file should live inside repo");
+        let repo_relative_path = repo_relative_path.to_string_lossy().into_owned();
+        exec_git(&["add", repo_relative_path.as_str()], repo.path());
+        exec_git(&["commit", "-m", "initial"], repo.path());
+
+        Ok(Self {
+            root: repo.path().to_path_buf(),
+            file,
+            _repo: repo,
+        })
+    }
+}
+
+fn exec_git(args: &[&str], repo: &Path) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_ASKPASS")
+        .env_remove("SSH_ASKPASS")
+        .env("GIT_TERMINAL_PROMPT", "false")
+        .env("GIT_AUTHOR_DATE", "2000-01-01 00:00:00 +0000")
+        .env("GIT_AUTHOR_EMAIL", "author@example.com")
+        .env("GIT_AUTHOR_NAME", "author")
+        .env("GIT_COMMITTER_DATE", "2000-01-02 00:00:00 +0000")
+        .env("GIT_COMMITTER_EMAIL", "committer@example.com")
+        .env("GIT_COMMITTER_NAME", "committer")
+        .env("GIT_CONFIG_COUNT", "2")
+        .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
+        .env("GIT_CONFIG_VALUE_0", "false")
+        .env("GIT_CONFIG_KEY_1", "init.defaultBranch")
+        .env("GIT_CONFIG_VALUE_1", "main")
+        .output()
+        .unwrap_or_else(|_| panic!("`git {}` failed", args.join(" ")));
+
+    if !output.status.success() {
+        println!("{}", String::from_utf8_lossy(&output.stdout));
+        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+        panic!("`git {}` failed", args.join(" "));
+    }
+}
 
 /// Specify how to set up the input text with line feeds
 #[derive(Clone, Debug)]

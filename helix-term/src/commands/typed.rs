@@ -2506,7 +2506,7 @@ fn show_diff(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> a
         return Ok(());
     }
 
-    open_diff_picker(cx);
+    open_current_buffer_diff(cx.editor)?;
     Ok(())
 }
 
@@ -3083,6 +3083,18 @@ fn open_diff_buffer_for_path(
     Ok(())
 }
 
+pub(crate) fn open_current_buffer_diff(editor: &mut Editor) -> anyhow::Result<()> {
+    if is_generated_diff_buffer(doc!(editor)) {
+        bail!("Current buffer is already a generated diff buffer");
+    }
+
+    let Some(path) = doc!(editor).path().cloned() else {
+        bail!("Current buffer is not associated with a file");
+    };
+
+    open_diff_buffer_for_path(editor, &path, Action::VerticalSplit)
+}
+
 fn replace_current_diff_buffer(editor: &mut Editor, path: &Path) -> anyhow::Result<()> {
     let Some(diff_data) = diff_for_path(editor, path)? else {
         editor.set_status("Selected file has no textual diff");
@@ -3104,7 +3116,7 @@ fn replace_current_diff_buffer(editor: &mut Editor, path: &Path) -> anyhow::Resu
     Ok(())
 }
 
-fn open_diff_picker(cx: &mut compositor::Context) {
+pub(crate) fn open_diff_picker(cx: &mut compositor::Context) {
     let cwd = helix_stdx::env::current_working_dir();
     if !cwd.exists() {
         cx.editor
