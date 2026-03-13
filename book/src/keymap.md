@@ -290,6 +290,7 @@ This layer is a kludge of mappings, mostly pickers.
 | -----   | -----------                                                             | -------                                    |
 | `f`     | Open file picker at LSP workspace root                                  | `file_picker`                              |
 | `F`     | Open file picker at current working directory                           | `file_picker_in_current_directory`         |
+| `e`     | Open file explorer in workspace root                                    | `file_explorer`                            |
 | `b`     | Open buffer picker                                                      | `buffer_picker`                            |
 | `j`     | Open jumplist picker                                                    | `jumplist_picker`                          |
 | `g`     | Open changed file picker                                                | `changed_file_picker`                      |
@@ -470,6 +471,21 @@ See the documentation page on [pickers](./pickers.md) for more info.
 | `Ctrl-v`                     | Open vertically                                            |
 | `Ctrl-t`                     | Toggle preview                                             |
 | `Escape`, `Ctrl-c`           | Close picker                                               |
+
+## File Tree Sidebar
+
+Keys to use within the file tree sidebar.
+
+| Key                  | Description                    |
+| -----                | -----------                    |
+| `j`, `Down`          | Next entry                     |
+| `k`, `Up`            | Previous entry                 |
+| `h`, `Left`          | Collapse directory / go parent |
+| `l`, `Right`         | Expand directory / go child    |
+| `Enter`              | Toggle directory or open file  |
+| `q`, `Escape`        | Close sidebar                  |
+
+The file tree sidebar is available through `:tree` or `:toggle-file-tree-sidebar`.
 
 ## Prompt
 

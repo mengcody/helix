@@ -152,6 +152,35 @@ fn open(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow:
     open_impl(cx, args, Action::Replace)
 }
 
+fn toggle_file_tree_sidebar(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let callback = async {
+        let call: job::Callback = job::Callback::EditorCompositor(Box::new(
+            move |editor: &mut Editor, compositor: &mut Compositor| {
+                let Some(editor_view) = compositor.find::<ui::EditorView>() else {
+                    editor.set_error("Editor view is not available");
+                    return;
+                };
+
+                if let Err(err) = editor_view.toggle_file_tree_sidebar(editor) {
+                    editor.set_error(err.to_string());
+                }
+            },
+        ));
+        Ok(call)
+    };
+    cx.jobs.callback(callback);
+
+    Ok(())
+}
+
 fn open_impl(cx: &mut compositor::Context, args: Args, action: Action) -> anyhow::Result<()> {
     for arg in args {
         let (path, pos) = crate::args::parse_file(&arg);
@@ -3863,6 +3892,17 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::all(completers::filename),
         signature: Signature {
             positionals: (1, None),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "toggle-file-tree-sidebar",
+        aliases: &["tree"],
+        doc: "Toggle the file tree sidebar.",
+        fun: toggle_file_tree_sidebar,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
             ..Signature::DEFAULT
         },
     },

@@ -7,6 +7,7 @@ use crate::{
     keymap::{KeymapResult, Keymaps},
     ui::{
         document::{render_document, LinePos, TextRenderer},
+        file_tree::FileTreeSidebar,
         statusline,
         text_decorations::{self, Decoration, DecorationManager, InlineDiagnostics},
         Completion, ProgressSpinners,
@@ -43,6 +44,7 @@ pub struct EditorView {
     pub(crate) last_insert: (commands::MappableCommand, Vec<InsertEvent>),
     pub(crate) completion: Option<Completion>,
     spinners: ProgressSpinners,
+    file_tree: Option<FileTreeSidebar>,
     /// Tracks if the terminal window is focused by reaction to terminal focus events
     terminal_focused: bool,
 }
@@ -67,12 +69,35 @@ impl EditorView {
             last_insert: (commands::MappableCommand::normal_mode, Vec::new()),
             completion: None,
             spinners: ProgressSpinners::default(),
+            file_tree: None,
             terminal_focused: true,
         }
     }
 
     pub fn spinners_mut(&mut self) -> &mut ProgressSpinners {
         &mut self.spinners
+    }
+
+    pub fn toggle_file_tree_sidebar(&mut self, editor: &mut Editor) -> std::io::Result<()> {
+        if let Some(sidebar) = self.file_tree.as_mut() {
+            if sidebar.is_focused() {
+                self.file_tree = None;
+            } else {
+                sidebar.focus();
+            }
+            return Ok(());
+        }
+
+        let root = helix_core::find_workspace().0;
+        if !root.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Workspace directory does not exist",
+            ));
+        }
+
+        self.file_tree = Some(FileTreeSidebar::new(root, editor)?);
+        Ok(())
     }
 
     pub fn render_view(
@@ -1455,6 +1480,41 @@ impl EditorView {
             false
         }
     }
+
+    fn handle_sidebar_key_event(&mut self, key: KeyEvent, editor: &mut Editor) -> EventResult {
+        let Some(sidebar) = self
+            .file_tree
+            .as_mut()
+            .filter(|sidebar| sidebar.is_focused())
+        else {
+            return EventResult::Ignored(None);
+        };
+
+        let result = match key {
+            key!(Esc) | key!('q') => {
+                self.file_tree = None;
+                Ok(())
+            }
+            key!('j') | key!(Down) => {
+                sidebar.move_down();
+                Ok(())
+            }
+            key!('k') | key!(Up) => {
+                sidebar.move_up();
+                Ok(())
+            }
+            key!('h') | key!(Left) => sidebar.collapse_or_parent(editor),
+            key!('l') | key!(Right) => sidebar.expand_or_descend(editor),
+            key!(Enter) => sidebar.activate(editor),
+            _ => Ok(()),
+        };
+
+        if let Err(err) = result {
+            editor.set_error(err.to_string());
+        }
+
+        EventResult::Consumed(None)
+    }
 }
 
 impl Component for EditorView {
@@ -1503,6 +1563,13 @@ impl Component for EditorView {
 
                 // clear status
                 cx.editor.status_msg = None;
+
+                if matches!(
+                    self.handle_sidebar_key_event(key, cx.editor),
+                    EventResult::Consumed(_)
+                ) {
+                    return EventResult::Consumed(None);
+                }
 
                 let mode = cx.editor.mode();
 
@@ -1644,6 +1711,13 @@ impl Component for EditorView {
             editor_area = editor_area.clip_top(1);
         }
 
+        if let Some(sidebar) = self.file_tree.as_mut() {
+            let sidebar_width = sidebar.width(editor_area.width);
+            let sidebar_area = editor_area.with_width(sidebar_width);
+            sidebar.render(sidebar_area, surface, cx.editor);
+            editor_area = editor_area.clip_left(sidebar_width + 1);
+        }
+
         // if the terminal size suddenly changed, we need to trigger a resize
         cx.editor.resize(editor_area);
 
@@ -1653,7 +1727,7 @@ impl Component for EditorView {
 
         for (view, is_focused) in cx.editor.tree.views() {
             let doc = cx.editor.document(view.doc).unwrap();
-            self.render_view(cx.editor, doc, view, area, surface, is_focused);
+            self.render_view(cx.editor, doc, view, editor_area, surface, is_focused);
         }
 
         if config.auto_info {
@@ -1727,7 +1801,27 @@ impl Component for EditorView {
         }
     }
 
-    fn cursor(&self, _area: Rect, editor: &Editor) -> (Option<Position>, CursorKind) {
+    fn cursor(&self, area: Rect, editor: &Editor) -> (Option<Position>, CursorKind) {
+        if let Some(sidebar) = self
+            .file_tree
+            .as_ref()
+            .filter(|sidebar| sidebar.is_focused())
+        {
+            let use_bufferline = match editor.config().bufferline {
+                helix_view::editor::BufferLine::Always => true,
+                helix_view::editor::BufferLine::Multiple if editor.documents.len() > 1 => true,
+                _ => false,
+            };
+            let mut editor_area = area.clip_bottom(1);
+            if use_bufferline {
+                editor_area = editor_area.clip_top(1);
+            }
+
+            let sidebar_width = sidebar.width(editor_area.width);
+            let sidebar_area = editor_area.with_width(sidebar_width);
+            return sidebar.cursor(sidebar_area);
+        }
+
         match editor.cursor() {
             // all block cursors are drawn manually
             (pos, CursorKind::Block) => {

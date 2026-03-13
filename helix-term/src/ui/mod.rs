@@ -2,6 +2,7 @@ mod completion;
 mod diff_viewer;
 mod document;
 pub(crate) mod editor;
+mod file_tree;
 mod info;
 pub mod lsp;
 mod markdown;
@@ -313,7 +314,7 @@ type FileExplorer = Picker<(PathBuf, bool), (PathBuf, Style)>;
 
 pub fn file_explorer(root: PathBuf, editor: &Editor) -> Result<FileExplorer, std::io::Error> {
     let directory_style = editor.theme.get("ui.text.directory");
-    let directory_content = directory_content(&root, editor)?;
+    let directory_content = directory_content(&root, editor, true)?;
 
     let columns = [PickerColumn::new(
         "path",
@@ -359,7 +360,11 @@ pub fn file_explorer(root: PathBuf, editor: &Editor) -> Result<FileExplorer, std
     Ok(picker)
 }
 
-fn directory_content(root: &Path, editor: &Editor) -> Result<Vec<(PathBuf, bool)>, std::io::Error> {
+pub(crate) fn directory_content(
+    root: &Path,
+    editor: &Editor,
+    include_parent: bool,
+) -> Result<Vec<(PathBuf, bool)>, std::io::Error> {
     use ignore::WalkBuilder;
 
     let config = editor.config();
@@ -399,7 +404,7 @@ fn directory_content(root: &Path, editor: &Editor) -> Result<Vec<(PathBuf, bool)
 
     content.sort_by(|(path1, is_dir1), (path2, is_dir2)| (!is_dir1, path1).cmp(&(!is_dir2, path2)));
 
-    if root.parent().is_some() {
+    if include_parent && root.parent().is_some() {
         content.insert(0, (root.join(".."), true));
     }
 
