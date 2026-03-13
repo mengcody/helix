@@ -2766,10 +2766,15 @@ pub(crate) fn diff_viewer_data_for_path(
 
         hunk_row_indices.push(rows.len());
         rows.push(ui::DiffRow::HunkHeader {
-            text: format!(
-                "@@ -{} +{} @@",
-                format_unified_range(&hunk.display_before),
-                format_unified_range(&hunk.display_after)
+            text: format_hunk_header_text(
+                &base,
+                &current,
+                hunk,
+                format!(
+                    "@@ -{} +{} @@",
+                    format_unified_range(&hunk.display_before),
+                    format_unified_range(&hunk.display_after)
+                ),
             ),
         });
 
@@ -2818,6 +2823,42 @@ pub(crate) fn diff_viewer_data_for_path(
         hunk_row_indices,
         preferred_row,
     }))
+}
+
+fn format_hunk_header_text(
+    before: &Rope,
+    after: &Rope,
+    hunk: &ExpandedHunk<'_>,
+    header: String,
+) -> String {
+    let context = hunk_context_label(before, hunk.display_before.clone())
+        .or_else(|| hunk_context_label(after, hunk.display_after.clone()));
+
+    match context {
+        Some(context) => format!("{header} {context}"),
+        None => header,
+    }
+}
+
+fn hunk_context_label(text: &Rope, range: std::ops::Range<u32>) -> Option<String> {
+    for line_idx in range.start as usize..range.end as usize {
+        let line = rope_line_text(text, line_idx);
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let compact = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+        if compact.len() > 48 {
+            return Some(format!(
+                "⋯ {}",
+                compact.chars().take(45).collect::<String>()
+            ));
+        }
+        return Some(format!("⋯ {compact}"));
+    }
+
+    None
 }
 
 fn diff_for_path(editor: &Editor, path: &Path) -> anyhow::Result<Option<DiffBufferData>> {
@@ -5317,5 +5358,20 @@ mod tests {
         );
 
         assert!(rendered.contains("... 5 unchanged lines ..."));
+    }
+
+    #[test]
+    fn hunk_header_text_includes_context_label() {
+        let before = Rope::from("fn before() {\n    old_value();\n}\n");
+        let after = Rope::from("fn before() {\n    new_value();\n}\n");
+        let hunk = ExpandedHunk {
+            display_before: 0..3,
+            display_after: 0..3,
+            raw_hunks: vec![],
+        };
+
+        let text = format_hunk_header_text(&before, &after, &hunk, "@@ -1,3 +1,3 @@".into());
+
+        assert_eq!(text, "@@ -1,3 +1,3 @@ ⋯ fn before() {");
     }
 }

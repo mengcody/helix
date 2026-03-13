@@ -6,7 +6,7 @@ use helix_view::{
     graphics::{Margin, Modifier, Rect},
     theme::Style,
 };
-use imara_diff::{Algorithm, Diff, Hunk, InternedInput};
+use imara_diff::{Algorithm, Diff, Hunk, InternedInput, Token};
 use tui::{
     buffer::Buffer as Surface,
     widgets::{Block, Widget},
@@ -405,10 +405,10 @@ struct InlineDiffSegment {
 
 fn push_inline_segment(
     segments: &mut Vec<InlineDiffSegment>,
-    text: impl Iterator<Item = char>,
+    text: impl Into<String>,
     highlighted: bool,
 ) {
-    let text: String = text.collect();
+    let text = text.into();
     if text.is_empty() {
         return;
     }
@@ -423,7 +423,109 @@ fn push_inline_segment(
     segments.push(InlineDiffSegment { text, highlighted });
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InlineTokenKind {
+    Whitespace,
+    Word,
+    Punctuation,
+}
+
 fn inline_diff_segments(left: &str, right: &str) -> InlineDiffSegments {
+    if left == right {
+        return InlineDiffSegments {
+            left: vec![InlineDiffSegment {
+                text: left.to_string(),
+                highlighted: false,
+            }],
+            right: vec![InlineDiffSegment {
+                text: right.to_string(),
+                highlighted: false,
+            }],
+        };
+    }
+
+    let left_tokens = tokenize_inline_text(left);
+    let right_tokens = tokenize_inline_text(right);
+    if left_tokens.len() <= 1 && right_tokens.len() <= 1 {
+        return char_inline_diff_segments(left, right);
+    }
+
+    token_inline_diff_segments(&left_tokens, &right_tokens)
+}
+
+fn token_inline_diff_segments(
+    left_tokens: &[String],
+    right_tokens: &[String],
+) -> InlineDiffSegments {
+    let mut input: InternedInput<String> = InternedInput::default();
+    input.update_before(left_tokens.iter().cloned());
+    input.update_after(right_tokens.iter().cloned());
+
+    let mut diff = Diff::default();
+    diff.compute_with(
+        Algorithm::Myers,
+        &input.before,
+        &input.after,
+        input.interner.num_tokens(),
+    );
+
+    let mut left_segments = Vec::new();
+    let mut right_segments = Vec::new();
+    let mut before_pos = 0usize;
+    let mut after_pos = 0usize;
+
+    for Hunk { before, after } in diff.hunks() {
+        push_inline_segment(
+            &mut left_segments,
+            join_tokens(&input.before[before_pos..before.start as usize], &input),
+            false,
+        );
+        push_inline_segment(
+            &mut right_segments,
+            join_tokens(&input.after[after_pos..after.start as usize], &input),
+            false,
+        );
+
+        let left_changed = join_tokens(
+            &input.before[before.start as usize..before.end as usize],
+            &input,
+        );
+        let right_changed = join_tokens(
+            &input.after[after.start as usize..after.end as usize],
+            &input,
+        );
+
+        if !left_changed.is_empty() && !right_changed.is_empty() {
+            let refined = char_inline_diff_segments(&left_changed, &right_changed);
+            append_segments(&mut left_segments, refined.left);
+            append_segments(&mut right_segments, refined.right);
+        } else {
+            push_inline_segment(&mut left_segments, left_changed, true);
+            push_inline_segment(&mut right_segments, right_changed, true);
+        }
+
+        before_pos = before.end as usize;
+        after_pos = after.end as usize;
+    }
+
+    push_inline_segment(
+        &mut left_segments,
+        join_tokens(&input.before[before_pos..], &input),
+        false,
+    );
+    push_inline_segment(
+        &mut right_segments,
+        join_tokens(&input.after[after_pos..], &input),
+        false,
+    );
+
+    InlineDiffSegments {
+        left: left_segments,
+        right: right_segments,
+    }
+}
+
+fn char_inline_diff_segments(left: &str, right: &str) -> InlineDiffSegments {
     let mut input = InternedInput::default();
     input.update_before(left.chars());
     input.update_after(right.chars());
@@ -446,28 +548,32 @@ fn inline_diff_segments(left: &str, right: &str) -> InlineDiffSegments {
             &mut left_segments,
             input.before[before_pos..before.start as usize]
                 .iter()
-                .map(|&token| input.interner[token]),
+                .map(|&token| input.interner[token])
+                .collect::<String>(),
             false,
         );
         push_inline_segment(
             &mut right_segments,
             input.after[after_pos..after.start as usize]
                 .iter()
-                .map(|&token| input.interner[token]),
+                .map(|&token| input.interner[token])
+                .collect::<String>(),
             false,
         );
         push_inline_segment(
             &mut left_segments,
             input.before[before.start as usize..before.end as usize]
                 .iter()
-                .map(|&token| input.interner[token]),
+                .map(|&token| input.interner[token])
+                .collect::<String>(),
             true,
         );
         push_inline_segment(
             &mut right_segments,
             input.after[after.start as usize..after.end as usize]
                 .iter()
-                .map(|&token| input.interner[token]),
+                .map(|&token| input.interner[token])
+                .collect::<String>(),
             true,
         );
         before_pos = before.end as usize;
@@ -478,20 +584,67 @@ fn inline_diff_segments(left: &str, right: &str) -> InlineDiffSegments {
         &mut left_segments,
         input.before[before_pos..]
             .iter()
-            .map(|&token| input.interner[token]),
+            .map(|&token| input.interner[token])
+            .collect::<String>(),
         false,
     );
     push_inline_segment(
         &mut right_segments,
         input.after[after_pos..]
             .iter()
-            .map(|&token| input.interner[token]),
+            .map(|&token| input.interner[token])
+            .collect::<String>(),
         false,
     );
 
     InlineDiffSegments {
         left: left_segments,
         right: right_segments,
+    }
+}
+
+fn append_segments(target: &mut Vec<InlineDiffSegment>, segments: Vec<InlineDiffSegment>) {
+    for segment in segments {
+        push_inline_segment(target, segment.text, segment.highlighted);
+    }
+}
+
+fn join_tokens(tokens: &[Token], input: &InternedInput<String>) -> String {
+    let mut joined = String::new();
+    for &token in tokens {
+        joined.push_str(&input.interner[token]);
+    }
+    joined
+}
+
+fn tokenize_inline_text(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut current_kind = None;
+
+    for ch in text.chars() {
+        let kind = inline_token_kind(ch);
+        if current_kind.is_some() && current_kind != Some(kind) {
+            tokens.push(std::mem::take(&mut current));
+        }
+        current_kind = Some(kind);
+        current.push(ch);
+    }
+
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    tokens
+}
+
+fn inline_token_kind(ch: char) -> InlineTokenKind {
+    if ch.is_whitespace() {
+        InlineTokenKind::Whitespace
+    } else if ch.is_alphanumeric() || ch == '_' {
+        InlineTokenKind::Word
+    } else {
+        InlineTokenKind::Punctuation
     }
 }
 
@@ -986,6 +1139,14 @@ mod tests {
                 show_leading_ellipsis: false,
                 show_trailing_ellipsis: true,
             }
+        );
+    }
+
+    #[test]
+    fn tokenize_inline_text_splits_words_whitespace_and_punctuation() {
+        assert_eq!(
+            tokenize_inline_text("foo(bar, baz)"),
+            vec!["foo", "(", "bar", ",", " ", "baz", ")"]
         );
     }
 }
